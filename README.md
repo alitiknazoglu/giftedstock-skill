@@ -54,7 +54,7 @@ PRIVATE_KEY=0x… node examples/giftedstock.mjs claim
 Actions: `buy`, `open`, `send`, `swap`, `gift`, `gift/open`, `gift/take-back` and `claim`. `wallet` is filled in from
 the key. `--yes` sends without asking. `BASE_RPC_URL` and `ROBINHOOD_RPC_URL` pick your own RPCs.
 
-Use a wallet that holds only what you mean to spend. The key stays in the process: requests carry addresses and
+The key stays in the process: requests carry addresses and
 signatures only. For a gift link the script makes a fresh link key and saves it to `giftedstock-link-<address>.key`
 (readable by you only) before anything is sent. Only its address goes to the API, and the share URL is printed once the
 gift is made. A keyed RPC address in `BASE_RPC_URL` or `ROBINHOOD_RPC_URL` can show in an error the script prints.
