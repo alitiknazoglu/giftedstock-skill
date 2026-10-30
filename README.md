@@ -6,9 +6,12 @@ swap stock tokens, bridge between Base and Robinhood Chain and make or claim gif
 
 - **[SKILL.md](SKILL.md)** is the guide an agent reads. The same file is served at
   [giftedstock.com/SKILL.md](https://www.giftedstock.com/SKILL.md).
+- **[verify.mjs](verify.mjs)** checks a plan before it is signed, against the request you sent and the contracts,
+  functions, inner calls, fee wallet and builder code pinned in the file, never against the API's own word. It needs
+  no key.
 - **[examples/giftedstock.mjs](examples/giftedstock.mjs)** runs one action from a wallet you hold the key to. It asks
-  the API for a plan and checks every step against the contracts and functions pinned in the file. It runs the whole
-  plan on the chain without sending it, shows you what leaves and reaches the wallet, and sends only after your yes.
+  the API for a plan, checks it with `verify.mjs`, runs the whole plan on the chain without sending it, shows you what
+  leaves and reaches the wallet and sends only after your yes.
 
 ## How it works
 
@@ -25,13 +28,31 @@ spender.
 mkdir -p ~/.claude/skills/giftedstock && curl -fsSL https://www.giftedstock.com/SKILL.md -o ~/.claude/skills/giftedstock/SKILL.md
 ```
 
-Any other agent: point it at `https://www.giftedstock.com/SKILL.md`.
+Any other agent: point it at `https://www.giftedstock.com/SKILL.md`. The copy you installed is the one to trust: if
+the live API ever names a contract, function or fee wallet it does not, stop (SKILL.md, rule 11).
 
-### The example script
+### Check a plan
 
 ```bash
 git clone https://github.com/alitiknazoglu/giftedstock-skill && cd giftedstock-skill && npm ci
 ```
+
+```bash
+node verify.mjs plan.json --wallet 0xYou --request '{"wallet":"0xYou","chain":"base","box":"normal","quantity":2,"payWith":"USDC"}'
+```
+
+It prints each step in words and `ok`, or `STOP` with the step that is not what was asked. `look yourself` lists what
+the API resolved for you (a name to an address, a symbol to a token address). It reads the chain (token decimals and
+symbols, a box's price, the gift box's fee) through `BASE_RPC_URL` and `ROBINHOOD_RPC_URL`, else each chain's public
+RPC; `--offline` checks opens, sends, claims and take-backs without it. `--link-key` gives a gift link's key address
+you made. From JavaScript:
+
+```js
+import { verifyPlan, defaultClients } from "./verify.mjs";
+const { ok, problems, lines, review, unchecked, expect } = await verifyPlan(plan, { wallet, request, clients: defaultClients() });
+```
+
+### The example script
 
 ```bash
 PRIVATE_KEY=0x… node examples/giftedstock.mjs buy '{"chain":"base","box":"normal","quantity":1,"payWith":"USDC"}'
@@ -51,32 +72,42 @@ PRIVATE_KEY=0x… node examples/giftedstock.mjs claim
 
 `claim` asks for the share URL, or reads it from `GIFT_URL`: never on the command line, where shell history keeps it.
 
-Actions: `buy`, `open`, `send`, `swap`, `gift`, `gift/open`, `gift/take-back` and `claim`. `wallet` is filled in from
-the key. `--yes` sends without asking. `BASE_RPC_URL` and `ROBINHOOD_RPC_URL` pick your own RPCs.
+Actions: `buy`, `open`, `send`, `settle`, `swap`, `gift`, `gift/open`, `gift/take-back` and `claim`. `wallet` is filled
+in from the key. `--yes` sends without asking, and only when nothing needs your own look: give recipients and stock tokens as
+addresses. `BASE_RPC_URL` and `ROBINHOOD_RPC_URL` pick your own RPCs.
 
-The key stays in the process: requests carry addresses and
-signatures only. For a gift link the script makes a fresh link key and saves it to `giftedstock-link-<address>.key`
-(readable by you only) before anything is sent. Only its address goes to the API, and the share URL is printed once the
-gift is made. A keyed RPC address in `BASE_RPC_URL` or `ROBINHOOD_RPC_URL` can show in an error the script prints.
+The key stays in the process: requests carry addresses and signatures only. For a gift link the script makes a fresh
+link key and saves it to `giftedstock-link-<address>.key` (readable by you only) before anything is sent. Only its
+address goes to the API, and the share URL is printed once the gift is made. A keyed RPC address in `BASE_RPC_URL` or
+`ROBINHOOD_RPC_URL` can show in an error the script prints.
 
-## What the script checks
+## What verify.mjs checks
 
-- Every step is on Base (8453) or Robinhood Chain (4663), and all steps of a plan are on one chain.
-- Every step calls a pinned contract with a function this action uses (a buy only `mint` or `mintWithEth` on a box,
-  a take-back only `reclaim` on the gift box), or is an ERC-20 `approve` that sends no ETH, for a spender this action
-  uses, for no more than the wallet holds. `setApprovalForAll`, `transferFrom` and the like are always refused.
-- The arguments that say who gains: a Relay deposit and a take-back for this wallet, a send to the address asked, a
-  gift to the wallets asked with the link key made here and no frontend fee, Permit2 rights for Uniswap's router only
-  and for an hour at most. Given names instead of addresses, the script shows the resolved addresses and will not
-  send with `--yes`.
-- A claim signs only a `Claim` of that link for this wallet on the gift box contract.
-- The whole plan runs on the chain first (`eth_simulateV1`). A step that would fail stops it, and a buy, a claim, a
-  take-back, a gift box opened or a swap on one chain must bring the wallet something. An RPC that can't simulate
-  means no `--yes`.
-- `validUntil` is kept, and each step waits for the one before to be mined with success.
+- The plan is the action your request body asks for, on its chain, and every step is on that chain.
+- Every step calls a pinned contract with a function that action uses, or is an ERC-20 `approve` that sends no ETH,
+  for a contract that action uses, for exactly what a later step takes. `setApprovalForAll`, `transferFrom` and the
+  like are always refused. A step's data is its selector and its arguments, then on Base the builder code, nothing
+  more.
+- What goes in is what you asked: the token and the amount of a swap or bridge (and the ETH sent with one), the box,
+  the quantity and the box's own price, the ids, the items, boxes and recipients of a gift.
+- Inside a Base router's `multicall`: one swap from the token asked to the one asked (through USDC at most), paying the
+  router itself, then one fee sweep of that token to your wallet, the fee to the fee wallet at 1% with a stock token
+  on either side and 0.75% otherwise. Inside Uniswap's `execute`: one hop or two through USDG, the amount asked then
+  all the router holds, no hooks, then that fee, then your wallet. Nothing is left in a router.
+- The least a swap pays is the summary's `minimumOut`, above 0; a plan's deadlines are within its `validUntil`.
+- A Relay deposit is for your wallet; a send goes to the address asked; a gift goes to the wallets asked, or behind a
+  link with your key, the gate (anyone, verified, your list) and times asked, the note you wrote, no frontend fee and
+  the gift box's own fee; a take-back comes to your wallet.
 
-What a router pays out comes from the dry run's token changes, and a bridge's payout on the other chain is not
-checked at all: your own read of the screen is the last check. If anything looks wrong, answer no.
+What it cannot see: a bridge's payout on the other chain (Relay's request id carries it: look it up with Relay itself)
+and whether a minimum is a fair price. The example script also runs the plan on the chain first (`eth_simulateV1`):
+a step that would fail stops it, a swap or bridge must take exactly the amount asked and nothing else and bring at
+least the minimum, and a buy, a claim, a take-back or an open of gift boxes must bring the wallet something. Your own
+read of the screen is the last check. If anything looks wrong, answer no.
+
+## Versions
+
+Each version is tagged; what changed is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
