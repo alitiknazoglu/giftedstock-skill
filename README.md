@@ -31,6 +31,20 @@ mkdir -p ~/.claude/skills/giftedstock && curl -fsSL https://www.giftedstock.com/
 Any other agent: point it at `https://www.giftedstock.com/SKILL.md`. The copy you installed is the one to trust: if
 the live API ever names a contract, function or fee wallet it does not, stop (SKILL.md, rule 11).
 
+### Bankr
+
+In a Bankr agent ([bankr.bot](https://bankr.bot)):
+
+```
+install the giftedstock skill from https://github.com/alitiknazoglu/giftedstock-skill
+```
+
+A Bankr wallet sends each step for you: SKILL.md's "With a Bankr wallet" says how, from Bankr's agent or its Wallet
+API. Every step is a contract call, so the wallet's "Enable arbitrary contract calls" must be on (bankr.bot, Security),
+which Bankr allows only once the account has MFA (a passkey or an authenticator app), and it needs ETH for gas on the
+chain. Bankr's daily and per-transaction limits count the ETH a step sends, and its NFT transfer count can count boxes
+that leave the wallet: SKILL.md lists every setting that can refuse a step, and the agent asks you to check them first. A Bankr refusal is final: the skill stops and says what Bankr said.
+
 ### Check a plan
 
 ```bash
@@ -70,7 +84,14 @@ PRIVATE_KEY=0x… node examples/giftedstock.mjs gift '{"items":[{"token":"NVDAc"
 PRIVATE_KEY=0x… node examples/giftedstock.mjs claim
 ```
 
+```bash
+BANKR_API_KEY=bk_… node examples/giftedstock.mjs buy '{"chain":"base","box":"normal","quantity":1,"payWith":"USDC"}' --bankr
+```
+
 `claim` asks for the share URL, or reads it from `GIFT_URL`: never on the command line, where shell history keeps it.
+`--bankr` sends through a Bankr wallet: the wallet is the Bankr key's EVM address, each step goes to Bankr's
+`/wallet/submit` as it is and `BANKR_API_KEY` goes to api.bankr.bot only. The key needs Wallet API access and must not
+be read-only.
 
 Actions: `buy`, `open`, `send`, `settle`, `swap`, `gift`, `gift/open`, `gift/take-back` and `claim`. `wallet` is filled
 in from the key. `--yes` sends without asking, and only when nothing needs your own look: give recipients and stock tokens as
@@ -89,7 +110,7 @@ address goes to the API, and the share URL is printed once the gift is made. A k
   like are always refused. A step's data is its selector and its arguments, then on Base the builder code, nothing
   more.
 - What goes in is what you asked: the token and the amount of a swap or bridge (and the ETH sent with one), the box,
-  the quantity and the box's own price, the ids, the items, boxes and recipients of a gift.
+  the quantity and the box's own price, the ids (or, with none asked, boxes your wallet holds), the items, boxes and recipients of a gift.
 - Inside a Base router's `multicall`: one swap from the token asked to the one asked (through USDC at most), paying the
   router itself, then one fee sweep of that token to your wallet, the fee to the fee wallet at 1% with a stock token
   on either side and 0.75% otherwise. Inside Uniswap's `execute`: one hop or two through USDG, the amount asked then

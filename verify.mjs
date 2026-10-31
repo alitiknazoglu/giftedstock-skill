@@ -19,13 +19,13 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   concat, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData,
-  erc20Abi, formatUnits, getAddress, http, isAddress, keccak256, parseAbi, parseAbiParameters, parseUnits, toBytes,
+  erc20Abi, formatEther, formatUnits, getAddress, http, isAddress, keccak256, parseAbi, parseAbiParameters, parseUnits, toBytes,
   toFunctionSelector, zeroAddress, zeroHash,
 } from "viem";
 import { formatAbiItem } from "viem/utils";
 import { base, robinhood } from "viem/chains";
 
-export const VERSION = "1.1.0";
+export const VERSION = "1.2.0";
 
 // Every contract a step may be sent to or approve, besides the token being approved (SKILL.md, "Contracts a step may
 // target"). If GET /api/agent/v1 ever names others, this file is right and the API is not: stop.
@@ -121,7 +121,7 @@ const relayAbi = parseAbi([
 ]);
 const approveAbi = parseAbi(["function approve(address spender, uint256 amount)"]);
 // reads
-const boxReadAbi = parseAbi(["function price() view returns (uint256)", "function mintPriceWei(uint256 qty) view returns (uint256)"]);
+const boxReadAbi = parseAbi(["function price() view returns (uint256)", "function mintPriceWei(uint256 qty) view returns (uint256)", "function ownerOf(uint256 id) view returns (address)"]);
 const batchOwnerAbi = parseAbi(["function batchOf(uint256 batchId) view returns ((address owner,uint32 requestedAt,uint16 count,bool revealed,bool settled,bool cancelled))"]);
 const giftSettingsAbi = parseAbi(["function settings() view returns (address feeWallet, uint32 feeBps, bool paused, address verifier, address renderer, uint8 maxSticker, uint256 boxesMade, uint256 batchesMade)"]);
 
@@ -169,6 +169,9 @@ export function actionOf(r) {
   if (Array.isArray(r.ids) && r.to !== undefined) return "send";
   if (Array.isArray(r.ids) && r.chain !== undefined) return "open";
   if (Array.isArray(r.ids)) return "gift_open";
+  // { wallet, chain, box } with no ids: open every sealed box of that kind the wallet holds (a recipient or a link
+  // in it means another action written wrong, never an open)
+  if (r.ids === undefined && r.to === undefined && r.batchId === undefined && r.chain !== undefined && r.box !== undefined) return "open";
   if (r.batchId !== undefined && r.signature !== undefined) return "gift_claim";
   if (r.batchId !== undefined) return "gift_take_back";
   return null;
@@ -251,6 +254,8 @@ function decodeStep(s, i, chainId) {
   if (!isAddr(s.to) || typeof s.data !== "string" || !/^0x([0-9a-fA-F]{2})*$/.test(s.data)) stop(`${n} is malformed`);
   if (typeof s.value !== "string" || !/^\d+$/.test(s.value)) stop(`${n}'s value is not wei as a decimal string`);
   const value = BigInt(s.value);
+  // the same amount in ETH, for a wallet that takes ETH (Bankr's agent): never a different number from the wei
+  if (s.valueEth !== undefined && s.valueEth !== formatEther(value)) stop(`${n}'s valueEth is ${String(s.valueEth).slice(0, 40)}, not its value of ${formatEther(value)} ETH`);
   const data = strip(chainId, s.data);
   const name = nameOf(chainId, s.to);
   if (!name) {
@@ -404,7 +409,18 @@ const CHECKS = {
     const box = boxOf(c);
     steps(c, 1, 1);
     const s = call(c.steps[0], [box], ["open"], `an open of ${box}`);
-    sameIds(s.args[0], c.request.ids, s.n);
+    if (c.request.ids !== undefined) sameIds(s.args[0], c.request.ids, s.n);
+    else {
+      // no ids asked: the API chose them, so each must be a distinct box this wallet holds (the box refuses one not
+      // sealed); read on the chain, or left to your own look without chain reads
+      const ids = s.args[0];
+      if (!ids.length || ids.length > 200 || new Set(ids.map(String)).size !== ids.length) stop(`${s.n} opens ${ids.length} boxes, or some twice`);
+      if (c.pub) {
+        const owners = await Promise.all(ids.map((id) => c.pub.readContract({ address: PINNED[c.chainId][box], abi: boxReadAbi, functionName: "ownerOf", args: [id] })));
+        const other = ids.find((id, i) => !same(owners[i], c.me));
+        if (other !== undefined) stop(`${s.n} opens box ${other}, which is not in your wallet`);
+      } else c.review.push(`the API chose boxes ${ids.join(", ")} to open: check they are yours to open`);
+    }
     c.lines.push(`${s.n}: open boxes ${s.args[0].join(", ")}, sending ${formatUnits(s.value, 18)} ETH (the box takes its fee and sends the rest back)`);
   },
 

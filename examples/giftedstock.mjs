@@ -8,12 +8,17 @@
  *   PRIVATE_KEY=0x… node examples/giftedstock.mjs swap '{"from":{"chain":"base","token":"USDC"},"to":{"chain":"base","token":"NVDAc"},"amount":"2"}'
  *   PRIVATE_KEY=0x… node examples/giftedstock.mjs gift '{"items":[{"token":"NVDAc","usd":"1"}],"payWith":"USDC","link":{"boxes":3,"who":"anyone"}}'
  *   PRIVATE_KEY=0x… GIFT_URL='https://www.giftedstock.com/gift?batch=12#k=0x…' node examples/giftedstock.mjs claim
+ *   BANKR_API_KEY=bk_… node examples/giftedstock.mjs buy '{"chain":"base","box":"normal","quantity":1,"payWith":"USDC"}' --bankr
  *
  * Actions: buy, open, send, settle, swap, gift, gift/open, gift/take-back, claim. `wallet` is filled in from the key. Add
  * --yes to send without asking (only where your human said so). BASE_RPC_URL and ROBINHOOD_RPC_URL pick other RPCs.
  *
  * The key never leaves this process: requests carry addresses and signatures only. A gift link's key is made here,
  * saved to a file only you can read before anything is sent, and only its address goes to the API.
+ *
+ * --bankr sends through a Bankr wallet instead (SKILL.md, "With a Bankr wallet"): the wallet is the Bankr key's EVM
+ * address (GET /wallet/me), each step goes to Bankr's POST /wallet/submit as it is, and BANKR_API_KEY goes to
+ * api.bankr.bot only. The checks and the dry run are the same.
  */
 import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
@@ -24,6 +29,7 @@ import { PINNED, verifyPlan } from "../verify.mjs";
 
 const API = "https://www.giftedstock.com/api/agent/v1";
 const SITE = "https://www.giftedstock.com";
+const BANKR = "https://api.bankr.bot";
 
 const GIFT_BOX = PINNED[8453].giftBox;
 
@@ -61,15 +67,39 @@ function fail(message) {
 const [, , action, input, ...rest] = process.argv;
 const flags = [input, ...rest].filter((a) => a?.startsWith("--"));
 const yes = flags.includes("--yes");
+const bankr = flags.includes("--bankr");
 if (!(action in ACTIONS) || (action !== "claim" && (!input || input.startsWith("--")))) {
-  fail("usage: node examples/giftedstock.mjs <buy|open|send|settle|swap|gift|gift/open|gift/take-back> '<json body>' [--yes], or GIFT_URL='<share url>' node examples/giftedstock.mjs claim [--yes]");
+  fail("usage: node examples/giftedstock.mjs <buy|open|send|settle|swap|gift|gift/open|gift/take-back> '<json body>' [--yes] [--bankr], or GIFT_URL='<share url>' node examples/giftedstock.mjs claim [--yes] [--bankr]");
 }
-if (!/^0x[0-9a-fA-F]{64}$/.test(process.env.PRIVATE_KEY ?? "")) fail("PRIVATE_KEY must be set to your wallet's key (0x and 64 hex)");
-const account = privateKeyToAccount(process.env.PRIVATE_KEY);
+
+/** Bankr's Wallet API with the key from BANKR_API_KEY: the key goes in its header to api.bankr.bot, nowhere else. */
+async function bankrApi(path, body) {
+  const res = await fetch(`${BANKR}${path}`, {
+    method: body ? "POST" : "GET",
+    headers: { "x-api-key": process.env.BANKR_API_KEY, ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { res, out: await res.json().catch(() => null) };
+}
+
+let account = null;
+let address;
+if (bankr) {
+  if (process.env.PRIVATE_KEY) fail("--bankr sends through Bankr: leave PRIVATE_KEY unset");
+  if (!process.env.BANKR_API_KEY) fail("--bankr needs BANKR_API_KEY: a Bankr API key with Wallet API access that is not read-only");
+  const { res, out } = await bankrApi("/wallet/me");
+  const evm = out?.wallets?.find?.((w) => w.chain === "evm")?.address;
+  if (!res.ok || !evm) fail(`Bankr's /wallet/me answered ${res.status}${typeof out?.error === "string" ? `: ${out.error.slice(0, 200)}` : ""}`);
+  address = getAddress(evm);
+} else {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(process.env.PRIVATE_KEY ?? "")) fail("PRIVATE_KEY must be set to your wallet's key (0x and 64 hex), or use --bankr with BANKR_API_KEY");
+  account = privateKeyToAccount(process.env.PRIVATE_KEY);
+  address = account.address;
+}
 
 const clients = Object.fromEntries(Object.entries(CHAINS).map(([id, c]) => [id, {
   pub: createPublicClient({ chain: c.chain, transport: http(c.rpc) }),
-  wallet: createWalletClient({ account, chain: c.chain, transport: http(c.rpc) }),
+  wallet: account ? createWalletClient({ account, chain: c.chain, transport: http(c.rpc) }) : null,
 }]));
 
 async function ask(path, body) {
@@ -79,7 +109,7 @@ async function ask(path, body) {
   return out;
 }
 
-const me = () => account.address;
+const me = () => address;
 const pubs = Object.fromEntries(Object.entries(clients).map(([id, c]) => [id, c.pub]));
 
 /**
@@ -138,7 +168,7 @@ const changeText = (c) => `${c.value.diff > 0n ? "+" : ""}${formatUnits(c.value.
 
 async function confirm(plan, { lines, expect }, changes, request) {
   const chainId = plan.steps[0].chainId;
-  console.log(`\n${action} on ${chainId === 8453 ? "Base" : "Robinhood Chain"} from ${me()}`);
+  console.log(`\n${action} on ${chainId === 8453 ? "Base" : "Robinhood Chain"} from ${me()}${bankr ? " (a Bankr wallet)" : ""}`);
   lines.forEach((l) => console.log(`  ${l}`));
   if (changes) {
     console.log(`the wallet, after all steps: ${changes.map(changeText).join(", ") || "no token changes"} (plus gas)`);
@@ -155,9 +185,52 @@ async function confirm(plan, { lines, expect }, changes, request) {
   if (plan.validUntil) console.log(`send before ${new Date(plan.validUntil * 1000).toISOString()}`);
   if (yes) return;
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question(`send ${plan.steps.length} transaction${plan.steps.length === 1 ? "" : "s"}? [y/N] `);
+  // no terminal to answer (stdin closed): the same as no
+  const answer = await new Promise((resolve) => {
+    rl.once("close", () => resolve(""));
+    rl.question(`send ${plan.steps.length} transaction${plan.steps.length === 1 ? "" : "s"}? [y/N] `).then(resolve, () => resolve(""));
+  });
   rl.close();
   if (answer.trim().toLowerCase() !== "y") fail("not sent");
+}
+
+/** One step through Bankr's /wallet/submit, as it is: a refusal stops here, and a step sent but not mined with success
+ *  stops with its hash, never sent again (the endpoint takes no idempotency key). Its label in Bankr's activity is this
+ *  script's own, never the API's text (SKILL.md rule 8). */
+async function bankrSubmit(s, i, total, gas) {
+  const maybeSent = (why) => fail(`step ${i + 1}: ${why}. It may have been sent: look at the wallet's activity before running anything again`);
+  let res, out;
+  try {
+    ({ res, out } = await bankrApi("/wallet/submit", {
+      transaction: { to: s.to, data: s.data, value: s.value, chainId: s.chainId, gas: gas.toString() },
+      description: `Gifted Stock ${action}, step ${i + 1} of ${total}`,
+      waitForConfirmation: true,
+    }));
+  } catch (e) {
+    maybeSent(`the request to Bankr broke off (${String(e?.cause?.code ?? e?.message ?? "no answer").slice(0, 80)})`);
+  }
+  const hash = typeof out?.transactionHash === "string" && /^0x[0-9a-fA-F]{64}$/.test(out.transactionHash) ? out.transactionHash : null;
+  if (res.ok && out?.success !== false && hash) return hash;
+  if (res.ok && !hash) maybeSent(`Bankr answered ${res.status} without a transaction hash`);
+  if (hash) fail(`step ${i + 1} was sent and did not succeed (${String(out?.status ?? res.status).slice(0, 40)}): ${hash}. Look it up before sending anything again`);
+  // Bankr's words as they are: its code, its error and message, and any link it gives (an approval, its docs)
+  const said = [out?.errorCode ?? out?.code, out?.error, out?.message].filter((x) => typeof x === "string").join(": ").slice(0, 500);
+  const links = Object.entries(out ?? {}).filter(([k, v]) => typeof v === "string" && /url|link/i.test(k)).map(([k, v]) => `${k}: ${v.slice(0, 300)}`);
+  fail(`Bankr did not send step ${i + 1} (${res.status}): ${said || "no reason given"}${links.length ? `\n  ${links.join("\n  ")}` : ""}${out && typeof out === "object" ? `\n  (its answer's fields: ${Object.keys(out).join(", ")})` : ""}. Only your human can change their Bankr settings`);
+}
+
+/** A step's gas, estimated from the wallet. Right after the step before it is mined, an RPC behind a load balancer may
+ *  not have that block yet (Bankr's first real run: the buy estimated against a node without its approval), so a later
+ *  step is estimated again for up to ten seconds before its revert counts. */
+async function estimate(pub, tx, i) {
+  for (let tries = i === 0 ? 1 : 6; ; tries--) {
+    try {
+      return await pub.estimateGas(tx);
+    } catch (e) {
+      if (tries <= 1) fail(`step ${i + 1} would fail: ${e.shortMessage ?? "reverted"}`);
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
 }
 
 /** The steps in order, each once the one before is mined with success. */
@@ -166,9 +239,9 @@ async function send(plan) {
   for (const [i, s] of plan.steps.entries()) {
     if (plan.validUntil && Date.now() / 1000 > plan.validUntil) fail("the plan is past validUntil: build it again");
     const { pub, wallet } = clients[s.chainId];
-    const tx = { account, to: s.to, data: s.data, value: BigInt(s.value) };
-    const gas = await pub.estimateGas(tx).catch((e) => fail(`step ${i + 1} would fail: ${e.shortMessage ?? "reverted"}`));
-    const hash = await wallet.sendTransaction({ ...tx, gas: (gas * 3n) / 2n });
+    const tx = { account: account ?? me(), to: s.to, data: s.data, value: BigInt(s.value) };
+    const gas = await estimate(pub, tx, i);
+    const hash = bankr ? await bankrSubmit(s, i, plan.steps.length, (gas * 3n) / 2n) : await wallet.sendTransaction({ ...tx, gas: (gas * 3n) / 2n });
     const receipt = await pub.waitForTransactionReceipt({ hash, timeout: 600_000 });
     if (receipt.status !== "success") fail(`step ${i + 1} failed: ${hash}`);
     console.log(`  ${i + 1}. done ${hash}`);
