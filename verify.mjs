@@ -14,6 +14,11 @@
  * it is what your human meant. `unchecked`: what this file cannot see. `expect`: what a swap or bridge must take from
  * the wallet and bring it, for a dry run to hold the plan to. The command line reads the chain through BASE_RPC_URL
  * and ROBINHOOD_RPC_URL, else each chain's public RPC; --offline checks opens, sends, claims and take-backs without it.
+ *
+ * 1.3.0: a gift or a basket goes through router v2 (each item on its own exchange, ETH an item) with the app-fee slot
+ * filled - the fee wallet's, or a basket maker's shown by a gift of theirs on the chain - 2.5% on top in all; a token
+ * (cbBTC, BNKR...) swaps through Aero's router or Uniswap's SwapRouter02; no gift paid with tokens held. Requests carry
+ * "skill": "1.3.0" (a gift or a basket without it is refused here: the API answers it as 1.2.0 did).
  */
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -25,7 +30,7 @@ import {
 import { formatAbiItem } from "viem/utils";
 import { base, robinhood } from "viem/chains";
 
-export const VERSION = "1.2.0";
+export const VERSION = "1.3.0";
 
 // Every contract a step may be sent to or approve, besides the token being approved (SKILL.md, "Contracts a step may
 // target"). If GET /api/agent/v1 ever names others, this file is right and the API is not: stop.
@@ -34,9 +39,10 @@ export const PINNED = {
     normalBox: "0xFc4633d297E936072cbf83e43F26B104B70188DC",
     premiumBox: "0xc7E36409B4F6A9D4F7Dd575E11C4C5beA682e827",
     giftBox: "0x5a095D4aB6f9aea04D87e10312FBf1d2695ABa8A",
-    giftRouter: "0x6f5a51E27452e5e6873cE9b253a0BF1f4145607B",
+    giftRouter: "0x60C52b3552B62bbaf7082B285FE269fc659ec439",
     aerodromeRouter: "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F",
     aeroRouter: "0x9Ee35Bf1bd69a03c6F0393582030fCe8Bb93D418",
+    uniswapRouter02: "0x2626664c2603336E57B271c5C0b26F421741e481",
     relayDepository: "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
   },
   4663: {
@@ -56,9 +62,24 @@ export const MONEY = {
 export const FEE_WALLET = "0xd98EE65e5271267EBE34f87B846403107c068A0f";
 /** The bytes after every Base step's arguments: Base's ERC-8021 builder code bc_lfbayxwx. The contract never reads them. */
 export const BUILDER_SUFFIX = "0x62635f6c666261797877780b0080218021802180218021802180218021";
-/** A swap's fee: 1% when a stock token is on either side, 0.75% between money and ETH. */
+/** A swap's fee: 1% when a stock token or a token (cbBTC, BNKR...) is on either side, 0.75% between money and ETH. */
 export const STOCK_FEE_BPS = 100n;
 export const MONEY_FEE_BPS = 75n;
+/** What a gift or a basket pays on top in all: the gift box's own fee, read from it, and the app-fee slot's share of it. */
+export const TOTAL_FEE_BPS = 250n;
+/** Base's Chainlink ETH/USD feed: the most an ETH payment for a gift may be worth, against what it buys. Read only. */
+export const ETH_USD_FEED = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70";
+/** Each exchange's own quoter (and Aero's pool factory), read only, never a step's target: what a gift's item costs now,
+ *  to hold its leg's maxIn to. */
+export const QUOTERS = {
+  slipstream: "0x514c8B5f54112481E28028F1166Bd78501089259",
+  aero: "0x1dDfeC5058180C207F55BB77D95AcDd0d8227868",
+  aeroFactory: "0x9CB220581b91b0C83223012FE69688b92aD07a76",
+  uniswapV3: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+  uniswapV4: "0x0d5e0F971ED27FBfF6c2837bf31316121532048D",
+};
+/** A leg's maxIn may be what its item costs now and this much more: the API's 0.5% margin and the price's moves since. */
+const LEG_ROOM_BPS = 300n;
 /** Uniswap's Universal Router reads this address as "the router itself", and ALL as "all the router holds". */
 const ROUTER_ITSELF = "0x0000000000000000000000000000000000000002";
 const ALL = 1n << 255n;
@@ -87,27 +108,35 @@ const giftStructs = [
   "struct Item { address token; uint256 amount; }",
   "struct Options { address linkKey; uint8 gateKind; bytes32 gate; bytes32 design; bytes32 messageHash; uint40 claimFrom; uint40 claimUntil; address frontend; uint16 frontendBps; uint32 maxFeeBps; }",
 ];
+// no `create`: a 1.3.0 gift is always bought through the router
 const giftAbi = parseAbi([
-  ...giftStructs,
-  "struct Permit { address token; uint256 value; uint256 deadline; uint8 v; bytes32 r; bytes32 s; }",
-  "function create(Item[] items, uint32 boxes, address[] recipients, Options opt, Permit[] permits) payable",
   "function claim(uint256 batchId, bytes linkSig, uint256 deadline, bytes verifierSig, bytes32[] proof)",
   "function open(uint256[] ids)",
   "function reclaim(uint256 batchId, uint32 count, address to)",
 ]);
+// router v2: each leg names its exchange (0 Aerodrome Slipstream, 1 Aero, 2 Uniswap v3, 3 Aerodrome classic, 4 Uniswap v4)
 const giftRouterAbi = parseAbi([
   ...giftStructs,
-  "struct Leg { bytes path; uint256 maxIn; }",
+  "struct Leg { uint8 venue; bytes path; uint256 maxIn; }",
   "struct UsdcPermit { uint256 value; uint256 deadline; uint8 v; bytes32 r; bytes32 s; }",
-  "struct Pay { uint256 budget; uint256 deadline; bytes ethPath; UsdcPermit permit; }",
+  "struct Pay { uint256 budget; uint256 deadline; uint8 ethVenue; bytes ethPath; UsdcPermit permit; }",
   "function buy(Item[] items, Leg[] legs, uint32 boxes, address[] recipients, Options opt, Pay pay) payable",
 ]);
 const routerAbi = parseAbi(["function multicall(bytes[] data) payable"]);
+// Uniswap's SwapRouter02: its multicall carries the deadline, its exactInput takes none
+const router02Abi = parseAbi(["function multicall(uint256 deadline, bytes[] data) payable"]);
 // what a Base router's multicall may hold (SKILL.md, "Inside multicall and execute")
 const routerInnerAbi = parseAbi([
   "struct ExactInputSingleParams { address tokenIn; address tokenOut; int24 tickSpacing; address recipient; uint256 deadline; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }",
   "function exactInputSingle(ExactInputSingleParams params) payable",
   "struct ExactInputParams { bytes path; address recipient; uint256 deadline; uint256 amountIn; uint256 amountOutMinimum; }",
+  "function exactInput(ExactInputParams params) payable",
+  "function sweepTokenWithFee(address token, uint256 amountMinimum, address recipient, uint256 feeBips, address feeRecipient) payable",
+  "function unwrapWETH9WithFee(uint256 amountMinimum, address recipient, uint256 feeBips, address feeRecipient) payable",
+  "function refundETH() payable",
+]);
+const router02InnerAbi = parseAbi([
+  "struct ExactInputParams { bytes path; address recipient; uint256 amountIn; uint256 amountOutMinimum; }",
   "function exactInput(ExactInputParams params) payable",
   "function sweepTokenWithFee(address token, uint256 amountMinimum, address recipient, uint256 feeBips, address feeRecipient) payable",
   "function unwrapWETH9WithFee(uint256 amountMinimum, address recipient, uint256 feeBips, address feeRecipient) payable",
@@ -124,9 +153,21 @@ const approveAbi = parseAbi(["function approve(address spender, uint256 amount)"
 const boxReadAbi = parseAbi(["function price() view returns (uint256)", "function mintPriceWei(uint256 qty) view returns (uint256)", "function ownerOf(uint256 id) view returns (address)"]);
 const batchOwnerAbi = parseAbi(["function batchOf(uint256 batchId) view returns ((address owner,uint32 requestedAt,uint16 count,bool revealed,bool settled,bool cancelled))"]);
 const giftSettingsAbi = parseAbi(["function settings() view returns (address feeWallet, uint32 feeBps, bool paused, address verifier, address renderer, uint8 maxSticker, uint256 boxesMade, uint256 batchesMade)"]);
+const giftBatchAbi = parseAbi(["function batchOf(uint256 batchId) view returns (address creator, uint40 createdAt, uint8 gateKind, address linkKey, uint32 boxes, uint32 unclaimed, uint40 claimFrom, uint40 claimUntil, bytes32 gate, bytes32 design, bytes32 messageHash)"]);
+const feedAbi = parseAbi(["function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)"]);
+const giftItemsAbi = parseAbi(["function batchItems(uint256 batchId) view returns ((address token, uint256 amount)[])"]);
+// the quoters as views (they revert inside and catch), as the site reads them
+const pathQuoterAbi = parseAbi(["function quoteExactOutput(bytes path, uint256 amountOut) view returns (uint256 amountIn, uint160[] a, uint32[] b, uint256 c)"]);
+const aeroQuoterAbi = parseAbi(["function quoteExactOutputSingleV3(address pool, address tokenIn, uint256 amountOut, uint160 sqrtPriceLimitX96) view returns (uint256 amountIn, uint160 a, uint32 b)"]);
+const aeroFactoryAbi = parseAbi(["function getPool(address tokenA, address tokenB, int24 tickSpacing) view returns (address)"]);
+const v4QuoterAbi = parseAbi([
+  "struct PoolKey { address currency0; address currency1; uint24 fee; int24 tickSpacing; address hooks; }",
+  "struct QuoteExactSingleParams { PoolKey poolKey; bool zeroForOne; uint128 exactAmount; bytes hookData; }",
+  "function quoteExactOutputSingle(QuoteExactSingleParams params) view returns (uint256 amountIn, uint256 gasEstimate)",
+]);
 
 const ABI_OF = {
-  8453: { normalBox: baseBoxAbi, premiumBox: baseBoxAbi, giftBox: giftAbi, giftRouter: giftRouterAbi, aerodromeRouter: routerAbi, aeroRouter: routerAbi, relayDepository: relayAbi },
+  8453: { normalBox: baseBoxAbi, premiumBox: baseBoxAbi, giftBox: giftAbi, giftRouter: giftRouterAbi, aerodromeRouter: routerAbi, aeroRouter: routerAbi, uniswapRouter02: router02Abi, relayDepository: relayAbi },
   4663: { normalBox: rhBoxAbi, premiumBox: rhBoxAbi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi },
 };
 
@@ -136,7 +177,8 @@ export const FUNCTIONS = {
   base: Object.fromEntries(Object.entries(ABI_OF[8453]).map(([k, abi]) => [k, sig(abi)])),
   robinhood: Object.fromEntries(Object.entries(ABI_OF[4663]).map(([k, abi]) => [k, sig(abi)])),
   token: sig(approveAbi),
-  multicall: sig(routerInnerAbi),
+  // every call a Base router's multicall may hold: Aerodrome's and Aero's, and SwapRouter02's own exactInput
+  multicall: [...sig(routerInnerAbi), ...sig(router02InnerAbi)].filter((f, i, all) => all.findIndex((g) => g.signature === f.signature) === i),
 };
 
 // Uniswap's Universal Router commands a plan uses, and each input's layout
@@ -156,14 +198,17 @@ const V4 = {
 };
 
 /** The actions a plan can be, and which of them are checked against the chain itself. */
-export const ACTIONS = ["buy", "open", "send", "settle", "swap", "bridge", "gift_create", "gift_link_create", "gift_claim", "gift_open", "gift_take_back"];
-const READS_CHAIN = new Set(["buy", "settle", "swap", "bridge", "gift_create", "gift_link_create"]);
+export const ACTIONS = ["buy", "open", "send", "settle", "swap", "bridge", "gift_create", "gift_link_create", "basket_buy", "gift_claim", "gift_open", "gift_take_back"];
+const READS_CHAIN = new Set(["buy", "settle", "swap", "bridge", "gift_create", "gift_link_create", "basket_buy"]);
+/** The actions whose plan 1.3.0 builds differently from 1.2.0: their request must name this version. */
+const NEEDS_SKILL = new Set(["gift_create", "gift_link_create", "basket_buy"]);
 
 /** What a request body asks for, by its shape: the plan must be that, whatever it calls itself. */
 export function actionOf(r) {
   if (!r || typeof r !== "object") return null;
   if (r.from && r.to && typeof r.from === "object" && typeof r.to === "object" && r.amount !== undefined) return r.from.chain === r.to.chain ? "swap" : "bridge";
   if (Array.isArray(r.items)) return r.link ? "gift_link_create" : "gift_create";
+  if (r.basket !== undefined) return "basket_buy";
   if (r.quantity !== undefined) return "buy";
   if (r.id !== undefined) return "settle";
   if (Array.isArray(r.ids) && r.to !== undefined) return "send";
@@ -335,7 +380,7 @@ async function tokenOf(c, asked, claimed, field) {
     c.pub.readContract({ address, abi: erc20Abi, functionName: "symbol" }),
   ]);
   if (!byAddress && !same(symbol, asked)) stop(`${field}: ${address} is ${symbol}, not ${asked}`);
-  if (!byAddress) c.review.push(`${field}: the API says ${asked} is ${address}: check it against a list you trust (Coinbase's tokenized stocks on Base, Robinhood's stock token registry on Robinhood Chain)`);
+  if (!byAddress) c.review.push(`${field}: the API says ${asked} is ${address}: check it against a list you trust (Coinbase's tokenized stocks on Base, Robinhood's stock token registry on Robinhood Chain, a token's own site)`);
   return { address, decimals: Number(decimals), symbol, kind: "stock" };
 }
 
@@ -355,9 +400,11 @@ export async function verifyPlan(plan, { wallet, request, action, linkKeyAddress
     if (!ACTIONS.includes(kind)) stop("the request body is not one this file knows");
     if (action && asked && action !== asked) stop(`the request body asks for ${an(asked)}, not ${an(action)}`);
     if (request.wallet !== undefined && !same(request.wallet, me)) stop("the request names another wallet");
+    if (request.skill !== undefined && request.skill !== VERSION) stop(`the request names skill ${String(request.skill).slice(0, 20)}, and this file is ${VERSION}`);
+    if (NEEDS_SKILL.has(kind) && request.skill !== VERSION) stop(`send "skill": "${VERSION}" with the request: without it the API answers as skill 1.2.0, through a router this file does not pin`);
     if (!plan || typeof plan !== "object" || !Array.isArray(plan.steps) || plan.steps.length === 0) stop("the plan has no steps");
     if (plan.action !== kind) stop(`you asked for ${an(kind)} and the plan is ${an(String(plan.action))}`);
-    const chainName = kind === "swap" || kind === "bridge" ? request.from?.chain : kind.startsWith("gift") ? "base" : request.chain;
+    const chainName = kind === "swap" || kind === "bridge" ? request.from?.chain : kind.startsWith("gift") || kind === "basket_buy" ? "base" : request.chain;
     const chainId = CHAIN_ID[chainName];
     if (!chainId) stop("the request names no chain (base or robinhood)");
     if (plan.validUntil !== undefined && !(typeof plan.validUntil === "number" && Number.isSafeInteger(plan.validUntil))) stop("the plan's validUntil is not unix seconds");
@@ -457,7 +504,7 @@ const CHECKS = {
     const from = await tokenOf(c, r.from.token, sm.from?.address ?? null, "from");
     const to = await tokenOf(c, r.to.token, sm.to?.address ?? null, "to");
     if (from.address === to.address) stop("from and to are the same token");
-    if (from.kind === "stock" && to.kind === "stock") stop("a stock token trades against money or ETH, not another stock token");
+    if (from.kind === "stock" && to.kind === "stock") stop("a stock token or a token trades against money or ETH, not against another");
     const amount = units(r.amount, from.decimals, "request.amount");
     if (amount === 0n) stop("request.amount is 0");
     const bps = from.kind === "stock" || to.kind === "stock" ? STOCK_FEE_BPS : MONEY_FEE_BPS;
@@ -508,6 +555,7 @@ const CHECKS = {
 
   gift_create: (c) => gift(c, false),
   gift_link_create: (c) => gift(c, true),
+  basket_buy: (c) => basket(c),
 
   async gift_claim(c) {
     steps(c, 1, 1);
@@ -537,12 +585,16 @@ const CHECKS = {
 };
 
 /** A Base swap: an exact approval for the router (unless ETH goes in), then multicall: one swap that pays the router
- *  itself, then one fee sweep that pays you, then refundETH when ETH went in. */
+ *  itself, then one fee sweep that pays you, then refundETH when ETH went in. On Aerodrome's or Aero's router
+ *  `multicall(data)`; on Uniswap's SwapRouter02 (a token's swap) `multicall(deadline, data)`, its exactInput without one. */
 function baseSwap(c, { from, to, amount, bps, minOut, until }) {
   const { weth, address: usdc } = MONEY[8453];
   const ethIn = from.kind === "eth";
   const ethOut = to.kind === "eth";
-  const last = call(c.steps.at(-1), ["aerodromeRouter", "aeroRouter"], ["multicall"], "a swap on a Base router");
+  const last = call(c.steps.at(-1), ["aerodromeRouter", "aeroRouter", "uniswapRouter02"], ["multicall"], "a swap on a Base router");
+  const uni = last.name === "uniswapRouter02";
+  const [outerDeadline, inner] = uni ? last.args : [null, last.args[0]];
+  if (uni && outerDeadline > until) stop(`${last.n}'s deadline is after the plan's validUntil`);
   if (ethIn) {
     steps(c, 1, 1);
     if (last.value !== amount) stop(`${last.n} sends ${formatUnits(last.value, 18)} ETH, not the ${formatUnits(amount, 18)} asked`);
@@ -551,7 +603,7 @@ function baseSwap(c, { from, to, amount, bps, minOut, until }) {
     noEth(last);
     if (c.steps.length === 2) approval(c.steps[0], from.address, last.name, amount);
   }
-  const calls = last.args[0].map((raw, j) => exact(routerInnerAbi, raw, `${last.n}, call ${j + 1} inside multicall`));
+  const calls = inner.map((raw, j) => exact(uni ? router02InnerAbi : routerInnerAbi, raw, `${last.n}, call ${j + 1} inside multicall`));
   if (calls.length !== (ethIn ? 3 : 2)) stop(`${last.n} carries ${calls.length} calls inside multicall, not ${ethIn ? 3 : 2}`);
   const [swap, payout, refund] = calls;
   const inToken = ethIn ? weth : from.address;
@@ -564,11 +616,13 @@ function baseSwap(c, { from, to, amount, bps, minOut, until }) {
   } else if (swap.functionName === "exactInput") {
     const tokens = pathTokens(p.path, where);
     if (!same(tokens[0], inToken) || !same(tokens.at(-1), outToken)) stop(`${where} swaps ${tokens[0]} for ${tokens.at(-1)}, not what was asked`);
-    if (tokens.length > 3 || tokens.slice(1, -1).some((x) => !same(x, usdc))) stop(`${where} routes through a token other than USDC`);
+    // two pools at most, through USDC or WETH (a token's route), never back through either end
+    const mid = tokens.slice(1, -1);
+    if (tokens.length > 3 || mid.some((x) => !(same(x, usdc) || same(x, weth)) || same(x, inToken) || same(x, outToken))) stop(`${where} routes through a token other than USDC or WETH`);
   } else stop(`${where} is not a swap`);
   if (!same(p.recipient, last.to)) stop(`${where} sends the swap's output to ${p.recipient}, not the router itself`);
   if (p.amountIn !== amount) stop(`${where} swaps ${p.amountIn}, not the ${amount} asked`);
-  if (p.deadline > until) stop(`${where}'s deadline is after the plan's validUntil`);
+  if (!uni && p.deadline > until) stop(`${where}'s deadline is after the plan's validUntil`);
   const pw = `${last.n}, call 2 inside multicall`;
   let min, recipient, fee, feeTo;
   if (ethOut) {
@@ -700,23 +754,225 @@ export function listRoot(wallets) {
   return layer[0];
 }
 
-/** A gift to wallets or behind a link: who gets it, what is inside, the fee and what pays for it, all as asked. */
+const SITE = "https://www.giftedstock.com";
+/** A basket's code: five lowercase letters and digits, one digit at least. */
+const BASKET_CODE = /^(?=[a-z0-9]*\d)[a-z0-9]{5}$/;
+
+/** The gift box's fee now, and the app-fee slot's share of TOTAL_FEE_BPS it leaves: what a gift pays on top. */
+async function feesNow(c) {
+  const [, feeBps] = await c.pub.readContract({ address: PINNED[8453].giftBox, abi: giftSettingsAbi, functionName: "settings" });
+  const fee = BigInt(feeBps);
+  return { fee, slot: fee < TOTAL_FEE_BPS ? TOTAL_FEE_BPS - fee : 0n };
+}
+
+/**
+ * Who takes the app-fee slot: the fee wallet, or - `maker` named, a basket bought - that maker. Exactly the share of
+ * TOTAL_FEE_BPS the gift box's fee leaves, never more: 2.5% on top in all. Returns "the fee wallet", "maker" or null (no
+ * slot, while the gift box's own fee is 2.5%).
+ */
+function slotOf(opt, { fee, slot }, n, maker) {
+  if (BigInt(opt.maxFeeBps) !== fee) stop(`${n} allows a fee of ${opt.maxFeeBps} bps, and the gift box's is ${fee}`);
+  if (BigInt(opt.frontendBps) !== slot) stop(`${n} pays an app fee of ${opt.frontendBps} bps, and with the gift box's ${fee} bps it is ${slot}: ${Number(TOTAL_FEE_BPS) / 100}% on top in all`);
+  if (slot === 0n) {
+    if (!same(opt.frontend, zeroAddress)) stop(`${n} names an app fee wallet, ${opt.frontend}, with no app fee`);
+    return null;
+  }
+  if (same(opt.frontend, FEE_WALLET)) return "the fee wallet";
+  if (maker && same(opt.frontend, maker)) return "maker";
+  stop(`${n} pays the app fee to ${opt.frontend}, not the fee wallet${maker ? " or the basket's maker" : ""}`);
+}
+
+/** What `amount` in each of `nb` boxes costs with both fees on it, each rounded up, as the gift box takes them. */
+const needOf = (amount, nb, { fee, slot }) => amount * nb + (amount * nb * fee + 9_999n) / 10_000n + (amount * nb * slot + 9_999n) / 10_000n;
+
+/** ETH's price at Base's Chainlink feed, 8 decimals, its age on the chain's own clock: over an hour old, or none, stops -
+ *  an ETH payment can't be checked without it. */
+async function ethPrice(c) {
+  if (c.eth8 !== undefined) return c.eth8;
+  const [[, answer, , updatedAt], head] = await Promise.all([
+    c.pub.readContract({ address: ETH_USD_FEED, abi: feedAbi, functionName: "latestRoundData" }),
+    c.pub.getBlock(),
+  ]);
+  if (!(answer > 0n) || Number(head.timestamp) - Number(updatedAt) > 3_600) stop("ETH's Chainlink price on Base is missing or over an hour old, so a payment in ETH can't be checked now: pay with USDC or try later");
+  c.eth8 = answer;
+  return answer;
+}
+
+/** Text from the API in a line this file prints: the characters a name may hold, at most `max` of them. */
+const clean = (v, max) => String(v ?? "").replace(/[^A-Za-z0-9 .,!?'&-]/g, "").slice(0, max);
+/** A box design's title (bytes 13 to 28 of its word), cleaned. */
+const titleOf = (design) => clean((design.slice(28, 60).match(/../g) ?? []).map((b) => parseInt(b, 16)).filter((x) => x).map((x) => String.fromCharCode(x)).join(""), 16);
+
+/**
+ * What `amountOut` of a leg's item costs now along its path, on its exchange's own quoter: a path quoter for Aerodrome
+ * Slipstream and Uniswap v3, pool by pool for Aero (each pool from its factory) and Uniswap v4. A leg nobody can quote
+ * stops.
+ */
+async function legCost(c, venue, path, item, amountOut, where) {
+  try {
+    if (venue === 0 || venue === 2) {
+      const [amountIn] = await c.pub.readContract({ address: venue === 0 ? QUOTERS.slipstream : QUOTERS.uniswapV3, abi: pathQuoterAbi, functionName: "quoteExactOutput", args: [path, amountOut] });
+      return amountIn;
+    }
+    let amount = amountOut;
+    if (venue === 1) {
+      const hex = path.slice(2);
+      for (let o = 0; o + 86 <= hex.length; o += 46) {
+        const out = getAddress(`0x${hex.slice(o, o + 40)}`);
+        const tickSpacing = parseInt(hex.slice(o + 40, o + 46), 16);
+        const tokenIn = getAddress(`0x${hex.slice(o + 46, o + 86)}`);
+        const pool = await c.pub.readContract({ address: QUOTERS.aeroFactory, abi: aeroFactoryAbi, functionName: "getPool", args: [out, tokenIn, tickSpacing] });
+        if (same(pool, zeroAddress)) throw new Error("no pool");
+        [amount] = await c.pub.readContract({ address: QUOTERS.aero, abi: aeroQuoterAbi, functionName: "quoteExactOutputSingleV3", args: [pool, tokenIn, amount, 0n] });
+      }
+      return amount;
+    }
+    const [keys] = decodeAbiParameters(poolKeysParams, path);
+    let out = item;
+    for (const k of keys) {
+      const zeroForOne = same(k.currency1, out);
+      [amount] = await c.pub.readContract({ address: QUOTERS.uniswapV4, abi: v4QuoterAbi, functionName: "quoteExactOutputSingle", args: [{ poolKey: k, zeroForOne, exactAmount: amount, hookData: "0x" }] });
+      out = zeroForOne ? k.currency0 : k.currency1;
+    }
+    return amount;
+  } catch (e) {
+    if (e instanceof Stop) throw e;
+    stop(`${where}: what it buys can't be quoted on its exchange now (no pool fills it): build the plan again later`);
+  }
+}
+
+/** A path of exchanges 0-3 (token, 3 bytes, token, ...): `first` to `last` in 1 to 3 pools, neither end in between. */
+function pathFrom(path, first, last, where) {
+  const tokens = pathTokens(path, where);
+  if (tokens.length > 4 || !same(tokens[0], first) || !same(tokens.at(-1), last) || tokens.slice(1, -1).some((t) => same(t, first) || same(t, last))) {
+    stop(`${where} does not go from ${first} to ${last} in 1 to 3 pools`);
+  }
+  return tokens;
+}
+
+const poolKeysParams = parseAbiParameters("(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)[]");
+/** A Uniswap v4 leg: abi.encode(PoolKey[]), 1 to 3 pools from the item to USDC, each joined to the next, no loop. The
+ *  router itself takes only pools its owner listed, and none with a hook that could rewrite a swap. */
+function v4From(path, item, usdc, where) {
+  let keys;
+  try {
+    [keys] = decodeAbiParameters(poolKeysParams, path);
+  } catch {
+    stop(`${where}'s Uniswap v4 path does not decode`);
+  }
+  if (encodeAbiParameters(poolKeysParams, [keys]).toLowerCase() !== path.toLowerCase()) stop(`${where}'s Uniswap v4 path carries extra bytes`);
+  if (!keys.length || keys.length > 3) stop(`${where} buys in ${keys.length} Uniswap v4 pools, not 1 to 3`);
+  let want = item;
+  keys.forEach((k, h) => {
+    if (same(k.currency0, want)) want = k.currency1;
+    else if (same(k.currency1, want)) want = k.currency0;
+    else stop(`${where}'s Uniswap v4 pools do not join`);
+    if (same(want, item) || (same(want, usdc) && h + 1 !== keys.length)) stop(`${where}'s Uniswap v4 path loops`);
+  });
+  if (!same(want, usdc)) stop(`${where} does not end in USDC`);
+}
+
+/**
+ * How the boxes are paid, through router v2: each item's leg - USDC put in as it is, an ETH payer's ETH from the payment,
+ * every other one bought on its exchange from USDC for at most its maxIn - the budget exactly those maxIns and the USDC
+ * with both fees, the deadline within validUntil, no permit; in USDC an exact approval of the budget, in ETH the boxes'
+ * ETH and no more than the budget is worth at Chainlink's price and 5%. Returns the budget, the boxes' ETH and ETH's price.
+ */
+async function payment(c, { last, items, legs, nb, fees, pay, symbols }) {
+  const { address: usdc, weth } = MONEY[8453];
+  const n = last.n;
+  const p = last.args[5];
+  if (c.plan.validUntil === undefined) stop("a gift bought through the router has a validUntil");
+  if (legs.length !== items.length) stop(`${n} buys ${legs.length} legs for ${items.length} tokens`);
+  let budget = 0n;
+  let ethItem = 0n;
+  for (const [i, it] of items.entries()) {
+    const leg = legs[i];
+    const where = `${n}, leg ${i + 1}`;
+    if (same(it.token, usdc) || (same(it.token, zeroAddress) && pay === "eth")) {
+      if (leg.venue !== 0 || leg.path !== "0x" || leg.maxIn !== 0n) stop(`${where} swaps for the ${symbols[i]} it puts in as it is`);
+      if (same(it.token, usdc)) budget += needOf(it.amount, nb, fees);
+      else ethItem = needOf(it.amount, nb, fees);
+      continue;
+    }
+    if (same(it.token, weth)) stop(`${where} puts WETH in a box: ETH is the item`);
+    // Aerodrome classic spends all of maxIn whatever the item costs: no plan of ours buys there (review, 13 Nov 2026)
+    if (leg.venue === 3) stop(`${where} buys on Aerodrome classic, which spends all of maxIn: no Gifted Stock plan does`);
+    const bought = same(it.token, zeroAddress) ? weth : it.token;
+    if (same(it.token, zeroAddress)) {
+      // a USDC payer's ETH: bought as WETH on exchanges 0-2
+      if (leg.venue > 2) stop(`${where} buys ETH on exchange ${leg.venue}`);
+      pathFrom(leg.path, weth, usdc, where);
+    } else if (leg.venue === 4) v4From(leg.path, it.token, usdc, where);
+    else if (leg.venue <= 2) pathFrom(leg.path, it.token, usdc, where);
+    else stop(`${where} names exchange ${leg.venue}`);
+    if (leg.maxIn === 0n) stop(`${where} buys with nothing`);
+    // what the item costs now on that path, from the exchange's own quoter: maxIn no more than that and 3%, whoever
+    // priced the amounts (review, 13 Nov 2026: a maxIn left to the API is a price left to it)
+    const need = needOf(it.amount, nb, fees);
+    const cost = await legCost(c, leg.venue, leg.path, bought, need, where);
+    if (leg.maxIn * 10_000n > cost * (10_000n + LEG_ROOM_BPS) + 10_000n) stop(`${where} may spend ${formatUnits(leg.maxIn, 6)} USDC on its ${symbols[i]}, over 3% above the ${formatUnits(cost, 6)} it costs now`);
+    budget += leg.maxIn;
+  }
+  c.lines.push(`${n}: each item's most to spend is within 3% of what it costs now, on its exchange's own quoter`);
+  if (p.budget !== budget) stop(`${n}'s budget is not what its legs and the USDC with both fees take`);
+  if (p.deadline > BigInt(c.plan.validUntil)) stop(`${n}'s deadline is after the plan's validUntil`);
+  const pm = p.permit;
+  if (pm.value !== 0n || pm.deadline !== 0n || pm.v !== 0 || pm.r !== zeroHash || pm.s !== zeroHash) stop(`${n} carries a permit you did not sign`);
+  if (pay === "usdc") {
+    if (p.ethPath !== "0x" || p.ethVenue !== 0) stop(`${n} pays with ETH, not USDC`);
+    noEth(last);
+    steps(c, 1, 2);
+    if (c.steps.length === 2) {
+      approval(c.steps[0], usdc, "giftRouter", budget);
+      c.lines.push(`${c.steps[0].n}: approve exactly ${formatUnits(budget, 6)} USDC for the gift router`);
+    }
+    c.lines.push(`${n}: pays at most ${formatUnits(budget, 6)} USDC; what it does not spend comes back`);
+    return { budget, ethItem: 0n, eth8: null };
+  }
+  steps(c, 1, 1);
+  if (p.ethVenue > 2) stop(`${n} buys its USDC with ETH on exchange ${p.ethVenue}`);
+  pathFrom(p.ethPath, usdc, weth, `${n}'s ETH path`);
+  if (budget === 0n ? last.value !== ethItem : last.value <= ethItem) {
+    stop(`${n} sends ${formatUnits(last.value, 18)} ETH, and the boxes' own ETH with both fees is ${formatUnits(ethItem, 18)}${budget === 0n ? "" : ", with USDC still to buy"}`);
+  }
+  const eth8 = await ethPrice(c);
+  const buying = last.value - ethItem;
+  if (budget > 0n && buying * eth8 * 100n > budget * 10n ** 20n * 105n) stop(`${n} sends ${formatUnits(buying, 18)} ETH to buy at most ${formatUnits(budget, 6)} USDC: over 5% above ETH's Chainlink price`);
+  c.lines.push(`${n}: sends ${formatUnits(last.value, 18)} ETH${ethItem ? ` (${formatUnits(ethItem, 18)} of it the boxes' ETH with both fees)` : ""} to buy at most ${formatUnits(budget, 6)} USDC; what it does not spend comes back as ETH`);
+  return { budget, ethItem, eth8 };
+}
+
+/** The symbols and decimals of what each box holds, ETH and USDC known, the rest read on the chain. */
+async function itemFacts(c, items) {
+  const { address: usdc } = MONEY[8453];
+  const read = (fn, it) => (same(it.token, zeroAddress) ? (fn === "symbol" ? "ETH" : 18) : same(it.token, usdc) ? (fn === "symbol" ? "USDC" : 6) : c.pub.readContract({ address: it.token, abi: erc20Abi, functionName: fn }));
+  const [symbols, decimals] = await Promise.all([Promise.all(items.map((it) => read("symbol", it))), Promise.all(items.map((it) => read("decimals", it)))]);
+  return { symbols, decimals };
+}
+
+/** A gift to wallets or behind a link: who gets it, what is inside, the fee and its slot, and what pays, all as asked. */
 async function gift(c, link) {
   const r = c.request;
   const pay = typeof r.payWith === "string" ? r.payWith.trim().toLowerCase() : "";
-  if (!["held", "hold", "usdc", "eth"].includes(pay)) stop("request.payWith is held, USDC or ETH");
-  const held = pay === "held" || pay === "hold";
-  const { address: usdc, weth } = MONEY[8453];
-  const [, feeBps] = await c.pub.readContract({ address: PINNED[8453].giftBox, abi: giftSettingsAbi, functionName: "settings" });
-  const fee = BigInt(feeBps);
-  const last = held ? call(c.steps.at(-1), ["giftBox"], ["create"], "the gift box's create") : call(c.steps.at(-1), ["giftRouter"], ["buy"], "the gift router's buy");
-  const a = last.args;
-  const [items, boxes, recipients, opt] = held ? [a[0], a[1], a[2], a[3]] : [a[0], a[2], a[3], a[4]];
+  if (pay === "held" || pay === "hold") stop(`skill ${VERSION} pays a gift with USDC or ETH: the gift router buys what each box holds`);
+  if (pay !== "usdc" && pay !== "eth") stop("request.payWith is USDC or ETH");
+  const { address: usdc } = MONEY[8453];
+  const fees = await feesNow(c);
+  const last = call(c.steps.at(-1), ["giftRouter"], ["buy"], "the gift router's buy");
+  const [items, legs, boxes, recipients, opt] = last.args;
   const n = last.n;
+  const nb = BigInt(boxes);
 
-  // who
-  if (opt.frontend !== zeroAddress || opt.frontendBps !== 0) stop(`${n} pays a frontend fee to ${opt.frontend}`);
-  if (BigInt(opt.maxFeeBps) !== fee) stop(`${n} allows a fee of ${opt.maxFeeBps} bps, and the gift box's is ${fee}`);
+  // who, the fee and its slot
+  const slotTo = slotOf(opt, fees, n, null);
+  // the box's design: none asked, the Gifted Stock box (zero); a design word, that word; the form's fields, as the API
+  // wrote them - its title shown here to look at (it shows on the recipients' boxes)
+  if (r.design === undefined || r.design === null) {
+    if (opt.design !== zeroHash) stop(`${n} puts a design on the box you did not ask for`);
+  } else if (typeof r.design === "string") {
+    if (!same(opt.design, r.design)) stop(`${n} puts another design on the box than yours`);
+  } else c.review.push(`${n}: the box's design is the API's word for yours${titleOf(opt.design) ? `; its title reads "${titleOf(opt.design)}"` : ""}`);
   const note = typeof r.note === "string" ? r.note.trim() : "";
   if (opt.messageHash !== (note ? keccak256(toBytes(note)) : zeroHash)) stop(`${n} carries another note than yours`);
   let who;
@@ -751,9 +1007,7 @@ async function gift(c, link) {
 
   // what is inside: each item asked once, by name or address; an amount asked exactly, a dollar amount as quoted
   if (!Array.isArray(r.items) || r.items.length !== items.length) stop(`${n} holds ${items.length} tokens, not the ${r.items?.length} asked`);
-  const read = (fn, it) => (same(it.token, zeroAddress) ? (fn === "symbol" ? "ETH" : 18) : same(it.token, usdc) ? (fn === "symbol" ? "USDC" : 6) : c.pub.readContract({ address: it.token, abi: erc20Abi, functionName: fn }));
-  const symbols = await Promise.all(items.map((it) => read("symbol", it)));
-  const decimals = await Promise.all(items.map((it) => read("decimals", it)));
+  const { symbols, decimals } = await itemFacts(c, items);
   const unmatched = items.map((_, i) => i);
   let usdTotal = 0n;
   let allUsd = true;
@@ -763,74 +1017,102 @@ async function gift(c, link) {
     const i = unmatched.find((k) => (isAddr(t) ? same(items[k].token, t) : same(symbols[k], t)));
     if (i === undefined) stop(`${n} does not hold the ${t} asked`);
     unmatched.splice(unmatched.indexOf(i), 1);
-    if (!isAddr(t) && !/^(eth|usdc)$/i.test(t)) c.review.push(`${n}: the API says ${t} is ${items[i].token}: check it against a list you trust (Coinbase's tokenized stocks)`);
+    if (!isAddr(t) && !/^(eth|usdc)$/i.test(t)) c.review.push(`${n}: the API says ${t} is ${items[i].token}: check it against a list you trust (Coinbase's tokenized stocks, the token's own site)`);
     if (want.amount !== undefined) {
       if (items[i].amount !== units(want.amount, Number(decimals[i]), `request.items ${t} amount`)) stop(`${n} puts other than ${want.amount} ${t} in each box`);
       allUsd = false;
     } else {
       const usd = units(want.usd, 2, `request.items ${t} usd`) * 10_000n; // dollars in USDC's 6 decimals
       if (same(items[i].token, usdc) && items[i].amount !== usd) stop(`${n} puts other than ${want.usd} USDC in each box`);
-      if (!same(items[i].token, usdc)) usdAsked.push(t);
-      usdTotal += usd;
+      if (same(items[i].token, zeroAddress)) {
+        // ETH asked in dollars: no more than 3% over them at Chainlink's price
+        const eth8 = await ethPrice(c);
+        if (items[i].amount * eth8 * 100n > usd * 10n ** 20n * 103n) stop(`${n} puts ${formatUnits(items[i].amount, 18)} ETH in each box: over 3% above the $${want.usd} asked at ETH's Chainlink price`);
+      } else if (!same(items[i].token, usdc)) usdAsked.push(t);
+      // what the USDC budget pays for: an ETH payer's ETH item comes out of the ETH sent, not the budget (review, 13 Nov 2026)
+      if (!(pay === "eth" && same(items[i].token, zeroAddress))) usdTotal += usd;
     }
     if (items[i].amount === 0n) stop(`${n} puts no ${t} in the boxes`);
   }
   const each = await Promise.all(items.map((it) => c.words(it.token, it.amount)));
 
-  // what pays: what the wallet holds, exactly what the contract takes; or the router, buying with USDC or ETH
-  const nb = BigInt(boxes);
-  const needOf = (amount) => amount * nb + (amount * nb * fee + 9_999n) / 10_000n;
-  if (held) {
-    if (a[4].length) stop(`${n} carries permits you did not sign`);
-    if (usdAsked.length) c.review.push(`${n} puts ${each.join(" + ")} in each box, priced by the API from the dollars asked: check it matches`);
-    const ethItem = items.find((it) => same(it.token, zeroAddress));
-    if (last.value !== (ethItem ? needOf(ethItem.amount) : 0n)) stop(`${n} sends other ETH than the boxes and the fee take`);
-    const approved = new Set();
-    for (const s of c.steps.slice(0, -1)) {
-      const it = items.find((x) => s.kind === "approve" && same(x.token, s.token));
-      if (!it || approved.has(it.token.toLowerCase())) stop(`${s.n} approves a token the gift does not take`);
-      approval(s, it.token, "giftBox", needOf(it.amount));
-      approved.add(it.token.toLowerCase());
-      c.lines.push(`${s.n}: approve exactly ${await c.words(it.token, needOf(it.amount))} for the gift box: what the boxes hold and the fee`);
-    }
-  } else {
-    if (c.plan.validUntil === undefined) stop("a gift bought through the router has a validUntil");
-    const [, legs, , , , p] = a;
-    if (legs.length !== items.length) stop(`${n} buys ${legs.length} legs for ${items.length} tokens`);
-    let budget = 0n;
-    items.forEach((it, i) => {
-      if (same(it.token, usdc)) {
-        if (legs[i].path !== "0x" || legs[i].maxIn !== 0n) stop(`${n} swaps for the USDC it puts in as is`);
-        budget += needOf(it.amount);
-      } else {
-        const tokens = pathTokens(legs[i].path, `${n}, leg ${i + 1}`);
-        if (tokens.length !== 2 || !same(tokens[0], it.token) || !same(tokens[1], usdc)) stop(`${n}, leg ${i + 1}, buys other than ${symbols[i]} with USDC in one pool`);
-        budget += legs[i].maxIn;
-      }
-    });
-    if (p.budget !== budget) stop(`${n}'s budget is not what its legs and the fee take`);
-    if (p.deadline > BigInt(c.plan.validUntil)) stop(`${n}'s deadline is after the plan's validUntil`);
-    if (p.permit.value !== 0n || p.permit.v !== 0) stop(`${n} carries a permit you did not sign`);
-    if (allUsd && budget > (usdTotal * nb * (10_000n + fee) * 103n) / 1_000_000n) stop(`${n} may spend ${formatUnits(budget, 6)} USDC, over 3% above the dollars asked and the fee`);
-    if (pay === "usdc") {
-      if (p.ethPath !== "0x") stop(`${n} pays with ETH, not USDC`);
-      noEth(last);
-      steps(c, 1, 2);
-      if (c.steps.length === 2) {
-        approval(c.steps[0], usdc, "giftRouter", budget);
-        c.lines.push(`${c.steps[0].n}: approve exactly ${formatUnits(budget, 6)} USDC for the gift router`);
-      }
-      c.lines.push(`${n}: pays at most ${formatUnits(budget, 6)} USDC; what it does not spend comes back`);
-    } else {
-      const path = pathTokens(p.ethPath, `${n}'s ETH path`);
-      if (path.length !== 2 || !same(path[0], usdc) || !same(path[1], weth)) stop(`${n} buys its USDC with ETH other than in one WETH/USDC pool`);
-      steps(c, 1, 1);
-      if (last.value === 0n) stop(`${n} sends no ETH`);
-      c.review.push(`${n} sends ${formatUnits(last.value, 18)} ETH for at most ${formatUnits(budget, 6)} USDC of stocks; what it does not spend comes back`);
-    }
-    if (!allUsd) c.review.push(`${n} may spend up to ${formatUnits(budget, 6)} USDC: check it fits the amounts asked`);
+  // what pays: the router, buying with USDC or ETH
+  const { budget } = await payment(c, { last, items, legs, nb, fees, pay, symbols });
+  if (allUsd && budget > (usdTotal * nb * (10_000n + fees.fee + fees.slot) * 103n) / 1_000_000n) {
+    stop(`${n} may spend ${formatUnits(budget, 6)} USDC, over 3% above the dollars asked and the fee`);
   }
-  c.lines.push(`${n}: make ${boxes} gift box${boxes === 1 ? "" : "es"}, each holding ${each.join(" + ")}, ${who}, the gift box's ${fee} bps fee on top`);
+  if (usdAsked.length) c.review.push(`${n} puts ${each.join(" + ")} in each box, priced by the API from the dollars asked: check it matches`);
+  if (!allUsd) c.review.push(`${n} may spend up to ${formatUnits(budget, 6)} USDC: check it fits the amounts asked`);
+  const fee = `${fees.fee} bps to the gift box${slotTo ? ` and ${fees.slot} bps app fee to the fee wallet` : ""} on top`;
+  c.lines.push(`${n}: make ${boxes} gift box${boxes === 1 ? "" : "es"}, each holding ${each.join(" + ")}, ${who}, ${fee}`);
+}
+
+/** A basket's code from the request: the code, or its link. */
+function basketCode(v) {
+  const s = typeof v === "string" ? v.trim() : "";
+  const code = BASKET_CODE.test(s) ? s : /^https:\/\/(www\.)?giftedstock\.com\/basket\/([a-z0-9]{5})\/?(?:[?#].*)?$/.exec(s)?.[2];
+  if (!code || !BASKET_CODE.test(code)) stop("request.basket is a basket's code (5 letters and digits) or its link");
+  return code;
+}
+
+/**
+ * A basket's boxes: that many, all to your wallet, no link, the basket's tag; the app-fee slot to the fee wallet or to the
+ * basket's maker - a wallet that made a gift with this tag, read on the chain - and what pays as a gift's. The mix, the
+ * box price and the design are the API's word (the basket's page shows them): the budget is held to that price.
+ */
+async function basket(c) {
+  const r = c.request;
+  const code = basketCode(r.basket);
+  const qty = r.quantity === undefined ? 1n : int(r.quantity, "request.quantity");
+  if (qty < 1n || qty > 100n) stop("request.quantity is 1 to 100");
+  const pay = r.payWith === undefined ? "usdc" : typeof r.payWith === "string" ? r.payWith.trim().toLowerCase() : "";
+  if (pay !== "usdc" && pay !== "eth") stop("request.payWith is USDC or ETH");
+  const fees = await feesNow(c);
+  const last = call(c.steps.at(-1), ["giftRouter"], ["buy"], "the gift router's buy");
+  const [items, legs, boxes, recipients, opt] = last.args;
+  const n = last.n;
+  const nb = BigInt(boxes);
+  if (nb !== qty) stop(`${n} makes ${boxes} boxes, not ${qty}`);
+  if (recipients.length !== Number(qty) || recipients.some((x) => !same(x, c.me))) stop(`${n} sends boxes to other wallets than yours`);
+  if (opt.linkKey !== zeroAddress || opt.gateKind !== 0 || opt.gate !== zeroHash || opt.claimFrom !== 0 || opt.claimUntil !== 0) stop(`${n} makes a link you did not ask for`);
+  const tag = keccak256(toBytes(`basket:${code}`));
+  if (opt.messageHash !== tag) stop(`${n} carries another tag than basket ${code}'s`);
+
+  // a basket's box carries no text (its title empty): the page's own boxes never do
+  if (titleOf(opt.design)) stop(`${n} writes "${titleOf(opt.design)}" on the box: a basket's box carries no text`);
+  if (!items.length || items.length > 20) stop(`${n} holds ${items.length} tokens`);
+
+  // the maker's first gift with this basket's tag, read on the chain: theirs, no link, the tag, the same tokens as
+  // these boxes. It shows the wallet bought this basket (anyone can make a tagged gift), so the maker is also named for
+  // your own look: the basket's page shows who made it.
+  const sb = c.plan.summary?.basket ?? {};
+  if (!isAddr(sb.maker)) stop("the summary names no maker for the basket");
+  const named = getAddress(sb.maker);
+  const id = int(sb.makerBatch, "summary.basket.makerBatch");
+  const [[creator, , , linkKey, , , , , , , messageHash], made] = await Promise.all([
+    c.pub.readContract({ address: PINNED[8453].giftBox, abi: giftBatchAbi, functionName: "batchOf", args: [id] }),
+    c.pub.readContract({ address: PINNED[8453].giftBox, abi: giftItemsAbi, functionName: "batchItems", args: [id] }),
+  ]);
+  if (!same(creator, named) || !same(linkKey, zeroAddress) || messageHash !== tag) stop(`gift ${id} on the chain is not ${named}'s with basket ${code}'s tag`);
+  const tokensOf = (xs) => xs.map((x) => x.token.toLowerCase()).sort().join();
+  if (tokensOf(made) !== tokensOf(items)) stop(`${n} holds other tokens than gift ${id}, the maker's own box of basket ${code}`);
+  const maker = same(named, c.me) ? null : named;
+  const slotTo = slotOf(opt, fees, n, maker);
+  c.review.push(`the API names ${named} as basket ${code}'s maker (they made gift ${id} with its tag and tokens): check the basket's page shows the same maker${slotTo === "maker" ? `; the app fee goes to them` : ""}`);
+  const { symbols } = await itemFacts(c, items);
+  const each = await Promise.all(items.map((it) => c.words(it.token, it.amount)));
+  if (items.some((it) => it.amount === 0n)) stop(`${n} puts nothing of a token in the boxes`);
+  const { budget, ethItem, eth8 } = await payment(c, { last, items, legs, nb, fees, pay, symbols });
+  // held to the basket's price the API names: its box price × boxes, 2.5% on top, 3% room (the page's own limit)
+  const boxUsd = units(sb.boxUsd, 6, "summary.basket.boxUsd");
+  if (boxUsd === 0n) stop("summary.basket.boxUsd is 0");
+  const cap = (boxUsd * qty * (10_000n + TOTAL_FEE_BPS) * 103n) / 1_000_000n;
+  const ethUsd = ethItem && eth8 ? (ethItem * eth8) / 10n ** 20n : 0n;
+  if (budget + ethUsd > cap) stop(`${n} may spend ${formatUnits(budget + ethUsd, 6)} USDC's worth, over 3% above ${qty} × ${formatUnits(boxUsd, 6)} and the fee`);
+  c.review.push(`${n} buys basket ${code}${sb.name ? ` ("${clean(sb.name, 24)}")` : ""} at ${formatUnits(boxUsd, 6)} USDC a box, each holding ${each.join(" + ")}: the API's word for the basket - check it at ${SITE}/basket/${code}`);
+  c.unchecked.push("a basket's mix, box price and design: they come from the API; the basket's page shows the same");
+  const to = slotTo === "maker" ? "its maker" : slotTo ?? "nobody";
+  c.lines.push(`${n}: buy ${qty} box${qty === 1n ? "" : "es"} of basket ${code} to your wallet, each holding ${each.join(" + ")}, ${fees.fee} bps to the gift box and ${fees.slot} bps app fee to ${to} on top`);
 }
 
 /** viem public clients for both chains: BASE_RPC_URL and ROBINHOOD_RPC_URL, else each chain's public RPC. */

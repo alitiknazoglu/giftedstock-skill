@@ -7,11 +7,13 @@
  *   PRIVATE_KEY=0x… node examples/giftedstock.mjs buy  '{"chain":"base","box":"normal","quantity":1,"payWith":"USDC"}'
  *   PRIVATE_KEY=0x… node examples/giftedstock.mjs swap '{"from":{"chain":"base","token":"USDC"},"to":{"chain":"base","token":"NVDAc"},"amount":"2"}'
  *   PRIVATE_KEY=0x… node examples/giftedstock.mjs gift '{"items":[{"token":"NVDAc","usd":"1"}],"payWith":"USDC","link":{"boxes":3,"who":"anyone"}}'
+ *   PRIVATE_KEY=0x… node examples/giftedstock.mjs basket '{"basket":"a1b2c","quantity":1,"payWith":"USDC"}'
  *   PRIVATE_KEY=0x… GIFT_URL='https://www.giftedstock.com/gift?batch=12#k=0x…' node examples/giftedstock.mjs claim
  *   BANKR_API_KEY=bk_… node examples/giftedstock.mjs buy '{"chain":"base","box":"normal","quantity":1,"payWith":"USDC"}' --bankr
  *
- * Actions: buy, open, send, settle, swap, gift, gift/open, gift/take-back, claim. `wallet` is filled in from the key. Add
- * --yes to send without asking (only where your human said so). BASE_RPC_URL and ROBINHOOD_RPC_URL pick other RPCs.
+ * Actions: buy, open, send, settle, swap, gift, basket, gift/open, gift/take-back, claim. `wallet` is filled in from the
+ * key, and `skill` with this repo's version (SKILL.md rule 12). Add --yes to send without asking (only where your human
+ * said so). BASE_RPC_URL and ROBINHOOD_RPC_URL pick other RPCs.
  *
  * The key never leaves this process: requests carry addresses and signatures only. A gift link's key is made here,
  * saved to a file only you can read before anything is sent, and only its address goes to the API.
@@ -25,7 +27,7 @@ import { createInterface } from "node:readline/promises";
 import { createPublicClient, createWalletClient, formatUnits, getAddress, http, zeroAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { base, robinhood } from "viem/chains";
-import { PINNED, verifyPlan } from "../verify.mjs";
+import { PINNED, VERSION, verifyPlan } from "../verify.mjs";
 
 const API = "https://www.giftedstock.com/api/agent/v1";
 const SITE = "https://www.giftedstock.com";
@@ -41,6 +43,7 @@ const ACTIONS = {
   settle: { path: "tx/settle", plan: "settle" },
   swap: { path: "tx/swap", plan: "swap" },
   gift: { path: "tx/gift", plan: "gift_create" },
+  basket: { path: "tx/basket", plan: "basket_buy" },
   "gift/open": { path: "tx/gift/open", plan: "gift_open", gains: true },
   "gift/take-back": { path: "tx/gift/take-back", plan: "gift_take_back", gains: true },
   claim: { path: "tx/gift/claim", plan: "gift_claim", gains: true },
@@ -69,7 +72,7 @@ const flags = [input, ...rest].filter((a) => a?.startsWith("--"));
 const yes = flags.includes("--yes");
 const bankr = flags.includes("--bankr");
 if (!(action in ACTIONS) || (action !== "claim" && (!input || input.startsWith("--")))) {
-  fail("usage: node examples/giftedstock.mjs <buy|open|send|settle|swap|gift|gift/open|gift/take-back> '<json body>' [--yes] [--bankr], or GIFT_URL='<share url>' node examples/giftedstock.mjs claim [--yes] [--bankr]");
+  fail("usage: node examples/giftedstock.mjs <buy|open|send|settle|swap|gift|basket|gift/open|gift/take-back> '<json body>' [--yes] [--bankr], or GIFT_URL='<share url>' node examples/giftedstock.mjs claim [--yes] [--bankr]");
 }
 
 /** Bankr's Wallet API with the key from BANKR_API_KEY: the key goes in its header to api.bankr.bot, nowhere else. */
@@ -122,7 +125,9 @@ async function check(plan, request, ctx) {
     : ACTIONS[action].plan;
   const r = await verifyPlan(plan, { wallet: me(), action: asked, request, linkKeyAddress: ctx.linkKeyAddress, clients: pubs });
   if (!r.ok) fail(r.problems.join("; "));
-  if (r.review.length && yes) fail(`with --yes, give addresses rather than names or symbols: ${r.review.join("; ")}`);
+  // --yes only when nothing needs your own look: names and symbols resolved by the API, a box design you described, a
+  // basket's maker and mix (always: the basket's page shows them)
+  if (r.review.length && yes) fail(`with --yes nothing may need your own look (give addresses rather than names or symbols; a basket always needs it): ${r.review.join("; ")}`);
   return { lines: [...r.lines, ...r.review.map((l) => `look yourself: ${l}`), ...r.unchecked.map((l) => `not checked: ${l}`)], expect: r.expect };
 }
 
@@ -280,7 +285,7 @@ async function shareUrl() {
 if (action === "claim") {
   // the link key signs here and goes nowhere: only a Claim for this wallet, this link, on the gift box contract
   const { batchId, linkKey } = await shareUrl();
-  const first = await ask(ACTIONS.claim.path, { wallet: me(), batchId });
+  const first = await ask(ACTIONS.claim.path, { wallet: me(), skill: VERSION, batchId });
   const td = first.sign?.typedData;
   if (
     !td || td.primaryType !== "Claim" || Number(td.domain?.chainId) !== 8453 || getAddress(td.domain?.verifyingContract ?? zeroAddress) !== GIFT_BOX ||
@@ -290,13 +295,13 @@ if (action === "claim") {
     domain: td.domain, primaryType: "Claim", message: { batchId: BigInt(batchId), claimer: me() },
     types: { Claim: [{ name: "batchId", type: "uint256" }, { name: "claimer", type: "address" }] },
   });
-  const receipts = await run({ wallet: me(), batchId, signature });
+  const receipts = await run({ wallet: me(), skill: VERSION, batchId, signature });
   const box = giftLog(receipts.at(-1), CLAIMED, 2);
   console.log(box !== null ? `claimed gift box #${box}: open it with gift/open` : "claimed");
 } else {
   let body;
   try {
-    body = { ...JSON.parse(input), wallet: me() };
+    body = { ...JSON.parse(input), wallet: me(), skill: VERSION };
   } catch {
     fail("the body must be JSON");
   }

@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.3.0 - 2026-11-13
+
+- Every request names the skill's version: `"skill": "1.3.0"` in each POST body, `?skill=1.3.0` on `GET /api/agent/v1`
+  and `/tokens` (rule 12). Without it the API answers as 1.2.0 did, so agents on 1.2.0 keep working.
+- Gifts go through the gift router v2 (`0x60C52b3552B62bbaf7082B285FE269fc659ec439`): each item on its own exchange
+  (Aerodrome Slipstream, Aero, Uniswap v3, Aerodrome classic, Uniswap v4), ETH as an item, tokens such as cbBTC and BNKR
+  in boxes. A gift is always bought, with USDC or ETH: `payWith: "held"` and the gift box's `create` are gone.
+- The fee on a gift is 2.5% on top, as on the site: the gift box's own fee (read from it) and the app-fee slot's share,
+  to the fee wallet. `verify.mjs` holds the slot to exactly that share and that wallet, and counts it in every budget.
+- `verify.mjs` quotes each item of a gift or a basket on its exchange's own quoter (pinned in `QUOTERS`, read only) and
+  stops a leg allowed to spend more than 3% over that; it never lets a leg buy on Aerodrome classic. The box's design
+  must be the one asked. The API holds a gift's quote to 3% over its contents at today's prices (`price_moved`).
+- Baskets: `POST /tx/basket` buys boxes of a basket someone published at giftedstock.com/basket, to your own wallet.
+  The slot's share goes to the basket's maker when you are not them. `verify.mjs` reads the maker's first box of the
+  basket on the chain (theirs, with its tag, no link, the same tokens as yours) and refuses text on a basket's box;
+  that box shows the maker bought the basket, so check the maker against the basket's page. The example script has a
+  `basket` action.
+- Tokens on Base (cbBTC, BNKR, VVV and the rest of `/tokens` with `kind` `token`) swap for USDC or ETH at 1%, through
+  Aero's router or Uniswap's SwapRouter02 (`0x2626664c2603336E57B271c5C0b26F421741e481`, pinned); each trade answers
+  `confirm_pool_price` first, as a stock with no Chainlink price does, and is held to the token's price on the site's
+  Swap tab.
+- An ETH payment for a gift or a basket is held to ETH's Chainlink price: no more than 5% over what it buys, and none
+  while that price is over an hour old.
+- `GET /wallet/{address}` lists tokens held too.
+
 ## 1.2.0 - 2026-10-31
 
 - With a Bankr wallet: SKILL.md says how to send a plan through Bankr, from its Wallet API (`POST /wallet/submit`) or
