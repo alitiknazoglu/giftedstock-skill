@@ -248,7 +248,7 @@ A Bankr wallet (https://bankr.bot) signs and sends each step for you: Bankr hold
 ```
 
 - Up to 200 sealed boxes your wallet holds, less than a year old. Leave `ids` out to open every sealed box of that kind the wallet holds, up to 200: `{ "wallet": "0xYou", "skill": "1.3.0", "chain": "base", "box": "normal" }`. The plan's `summary.ids` names them; `nothing_to_open` (404) when there is none. Opening sends a small fee in ETH (`openFeeEth` in `/boxes`).
-- A box goes `sealed` → `opening` → `opened` within seconds: our keeper settles each batch once its random number is in (Base: Pyth Entropy; Robinhood Chain: drand, 4-7 seconds from the open). Read the prize with `GET /box/{chain}/{box}/{id}`.
+- A box goes `sealed` → `opening` → `opened` within seconds: each batch settles once its random number is in (Base: Pyth Entropy; Robinhood Chain: drand, 4-7 seconds from the open). Read the prize with `GET /box/{chain}/{box}/{id}`.
 
 ### A box that stays opening
 
@@ -259,7 +259,7 @@ A Bankr wallet (https://bankr.bot) signs and sends each step for you: Bankr hold
 - On Robinhood Chain the plan carries drand's signature for the batch's round, checked by the box's own beacon.
 - On Base, a batch whose random number never came returns to sealed instead, 7 days after the open, to be opened again; the open fee is not refunded.
 - Earlier, the answer is `too_early` with the time.
-- `payout_blocked`: a stock in the batch cannot be sent right now, so settling it yourself would forfeit those prizes while the keeper waits to pay them. Send `"acceptForfeit": true` only if your human accepts losing them.
+- `payout_blocked`: a stock in the batch cannot be sent right now, so settling it yourself would forfeit those prizes while we wait to pay them. Send `"acceptForfeit": true` only if your human accepts losing them.
 
 ### Send
 
