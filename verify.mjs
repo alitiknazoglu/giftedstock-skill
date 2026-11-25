@@ -30,7 +30,7 @@ import {
 import { formatAbiItem } from "viem/utils";
 import { base, robinhood } from "viem/chains";
 
-export const VERSION = "1.3.0";
+export const VERSION = "1.4.0";
 
 // Every contract a step may be sent to or approve, besides the token being approved (SKILL.md, "Contracts a step may
 // target"). If GET /api/agent/v1 ever names others, this file is right and the API is not: stop.
@@ -43,6 +43,9 @@ export const PINNED = {
     aerodromeRouter: "0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F",
     aeroRouter: "0x9Ee35Bf1bd69a03c6F0393582030fCe8Bb93D418",
     uniswapRouter02: "0x2626664c2603336E57B271c5C0b26F421741e481",
+    // 1.4.0: Uniswap's Universal Router 2.1.2 on Base and Permit2, a token's Uniswap v4 route (AXIS)
+    uniswapRouter: "0xd6145b2D3F379919E8CdEda7B97e37c4b2Ca9c40",
+    permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
     relayDepository: "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
   },
   4663: {
@@ -57,6 +60,15 @@ export const PINNED = {
 export const MONEY = {
   8453: { symbol: "USDC", address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", weth: "0x4200000000000000000000000000000000000006" },
   4663: { symbol: "USDG", address: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", weth: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73" },
+};
+/**
+ * The only Uniswap v4 pools with a hook a swap may trade through, by their whole key (currency0, currency1, fee,
+ * tickSpacing, hooks), by chain: on Base AXIS/USDC (its hook can refuse a swap, never take from one: its address flags
+ * no delta-returning permission and the fee is static). Every other v4 pool must have no hook.
+ */
+export const HOOKED_POOLS = {
+  8453: [["0x5bE75e3b0aFf5D1A042A5363Ae36AcB1d6d755ea", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 100, 1, "0xB0b24B89dB0dafbE43C5b40226b63A179f592880"]],
+  4663: [],
 };
 /** The one address besides yours a swap or bridge pays: the fee in a plan's `summary.fee`. It is never called. */
 export const FEE_WALLET = "0xd98EE65e5271267EBE34f87B846403107c068A0f";
@@ -167,7 +179,7 @@ const v4QuoterAbi = parseAbi([
 ]);
 
 const ABI_OF = {
-  8453: { normalBox: baseBoxAbi, premiumBox: baseBoxAbi, giftBox: giftAbi, giftRouter: giftRouterAbi, aerodromeRouter: routerAbi, aeroRouter: routerAbi, uniswapRouter02: router02Abi, relayDepository: relayAbi },
+  8453: { normalBox: baseBoxAbi, premiumBox: baseBoxAbi, giftBox: giftAbi, giftRouter: giftRouterAbi, aerodromeRouter: routerAbi, aeroRouter: routerAbi, uniswapRouter02: router02Abi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi },
   4663: { normalBox: rhBoxAbi, premiumBox: rhBoxAbi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi },
 };
 
@@ -513,8 +525,9 @@ const CHECKS = {
     if (minOut === 0n) stop("the summary's minimumOut is 0");
     if (c.plan.validUntil === undefined) stop("a swap plan has a validUntil");
     const t = { from, to, amount, bps, minOut, until: BigInt(c.plan.validUntil) };
-    if (c.chainId === 8453) baseSwap(c, t);
-    else rhSwap(c, t);
+    // on Base a token's Uniswap v4 route (AXIS) goes through the Uniswap router, as every Robinhood Chain swap does
+    if (c.chainId === 8453 && c.steps.at(-1)?.name !== "uniswapRouter") baseSwap(c, t);
+    else uniSwap(c, t);
     c.out.expect = { spend: [{ token: from.address, amount }], gain: [{ token: to.address, atLeast: minOut }] };
     c.lines.push(`in all: ${await c.words(from.address, amount)} for at least ${await c.words(to.address, minOut)} to your wallet, ${bps} bps to the fee wallet`);
     c.unchecked.push("whether the minimum is a fair price: compare summary.to.minimumOut with a price you trust");
@@ -642,11 +655,14 @@ function baseSwap(c, { from, to, amount, bps, minOut, until }) {
   c.lines.push(`${last.n}: swap through ${last.name}: one swap into the router, then one sweep to your wallet with the fee to the fee wallet`);
 }
 
-/** A Robinhood Chain swap: an exact approval for Permit2 and Permit2's for the Uniswap router (unless ETH goes in or
- *  they stand already), then execute: one or two hops into the router itself, the amount asked on the first and all
- *  the router holds after, through USDG only, then the fee to the fee wallet, then SWEEP to you. */
-function rhSwap(c, { from, to, amount, bps, minOut, until }) {
-  const { weth, address: usdg } = MONEY[4663];
+/** A swap through the Uniswap router (every Robinhood Chain swap; on Base a token's Uniswap v4 route, AXIS): an exact
+ *  approval for Permit2 and Permit2's for that chain's Uniswap router (unless ETH goes in or they stand already), then
+ *  execute: one or two hops into the router itself, the amount asked on the first and all the router holds after,
+ *  through the chain's money only (USDG, USDC), v4 pools with no hook or one of HOOKED_POOLS, then the fee to the fee
+ *  wallet, then SWEEP to you. */
+function uniSwap(c, { from, to, amount, bps, minOut, until }) {
+  const { weth, address: usdg, symbol: moneySymbol } = MONEY[c.chainId];
+  const router = PINNED[c.chainId].uniswapRouter;
   const ethIn = from.kind === "eth";
   const last = call(c.steps.at(-1), ["uniswapRouter"], ["execute"], "a swap on the Uniswap router");
   const [commands, inputs, deadline] = last.args;
@@ -668,7 +684,7 @@ function rhSwap(c, { from, to, amount, bps, minOut, until }) {
         noEth(s);
         if (before.filter((x) => x.kind === "call").length > 1) stop(`${s.n} is a second Permit2 approval`);
         const [token, spender, amt, expiration] = s.args;
-        if (!same(token, from.address) || !same(spender, PINNED[4663].uniswapRouter) || amt !== amount) stop(`${s.n} gives Permit2 rights other than the amount asked, to Uniswap's router`);
+        if (!same(token, from.address) || !same(spender, router) || amt !== amount) stop(`${s.n} gives Permit2 rights other than the amount asked, to Uniswap's router`);
         if (BigInt(expiration) > deadline) stop(`${s.n}'s Permit2 rights outlast the swap's deadline`);
         c.lines.push(`${s.n}: let Uniswap's router take exactly the amount asked through Permit2, until the swap's deadline`);
       }
@@ -706,10 +722,11 @@ function rhSwap(c, { from, to, amount, bps, minOut, until }) {
       if (actions.toLowerCase() !== V4_ACTIONS || params.length !== 3) stop(`${where} is not one v4 hop (SETTLE, SWAP, TAKE)`);
       const [currency, amt, payerIsUser] = exactParams(V4.settle, params[0], `${where}, SETTLE`);
       const [[key, zeroForOne, amountIn, , , hookData]] = exactParams(V4.swap, params[1], `${where}, SWAP`);
-      const [c0, c1, , , hooks] = key;
+      const [c0, c1, poolFee, spacing, hooks] = key;
       const [taken, takeTo, takeAmt] = exactParams(V4.take, params[2], `${where}, TAKE`);
       if (same(cur, weth) || !same(currency, cur) || amt !== (first ? amount : ALL) || payerIsUser !== (first && !ethIn)) stop(`${where} pays in other than ${first ? "the amount asked" : "all the router holds"}`);
-      if (!same(hooks, zeroAddress) || hookData !== "0x") stop(`${where} trades through a pool with a hook`);
+      const allowedHook = HOOKED_POOLS[c.chainId].some(([a0, a1, f, t, h]) => same(c0, a0) && same(c1, a1) && poolFee === f && spacing === t && same(hooks, h));
+      if ((!same(hooks, zeroAddress) && !allowedHook) || hookData !== "0x") stop(`${where} trades through a pool with a hook`);
       if (!same(zeroForOne ? c0 : c1, currency) || amountIn !== 0n) stop(`${where} swaps other than what it paid in`);
       if (!same(taken, zeroForOne ? c1 : c0) || !same(takeTo, ROUTER_ITSELF) || takeAmt !== 0n) stop(`${where} takes other than the swap's whole output into the router itself`);
       cur = taken;
@@ -728,7 +745,7 @@ function rhSwap(c, { from, to, amount, bps, minOut, until }) {
     }
     // between two hops the router holds USDG (or ETH as WETH or 0x0 around a wrap)
     if ((cmd === 0x00 || cmd === 0x10) && hop === 1 && cmds.slice(j + 1).some((x) => x === 0x00 || x === 0x10)) {
-      if (!same(cur, usdg)) stop(`${where} routes through a token other than USDG`);
+      if (!same(cur, usdg)) stop(`${where} routes through a token other than ${moneySymbol}`);
     }
   }
   if (hop < 1 || hop > 2) stop(`${last.n} has ${hop} hops, not one or two`);

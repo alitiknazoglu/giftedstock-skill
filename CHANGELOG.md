@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.0 - 2026-11-25
+
+- AXIS on Base swaps through its Uniswap v4 pool, where its market is: through Uniswap's Universal Router on Base
+  (`0xd6145b2D3F379919E8CdEda7B97e37c4b2Ca9c40`, pinned) with Permit2 (`0x000000000022D473030F116dDEE9F6B43aC78BA3`,
+  pinned), as every Robinhood Chain swap does: an exact approval to Permit2, Permit2's own exact approval for the router
+  until the swap's deadline, then `execute` with the fee to the fee wallet and the rest to your wallet. The API takes
+  whichever of a token's routes pays more, so other tokens keep Aero's router or Uniswap's SwapRouter02.
+- `verify.mjs` checks `execute` on Base as on Robinhood Chain, through USDC between two hops, and allows one Uniswap v4
+  pool with a hook, AXIS/USDC on Base, by its whole key (`HOOKED_POOLS`): its hook can refuse a swap, never take from
+  one. Every other v4 pool must have no hook.
+- Send `"skill": "1.4.0"`. Agents on 1.3.0 keep AXIS on its Uniswap v3 route.
+
 ## 1.3.0 - 2026-11-13
 
 - Every request names the skill's version: `"skill": "1.3.0"` in each POST body, `?skill=1.3.0` on `GET /api/agent/v1`

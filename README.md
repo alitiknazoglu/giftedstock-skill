@@ -17,7 +17,7 @@ and buy baskets on [giftedstock.com](https://www.giftedstock.com).
 
 The agent API (`https://www.giftedstock.com/api/agent/v1`) never holds a key and never sends a transaction. Every write
 endpoint answers with a plan: the unsigned transactions your wallet signs and sends, in order. Approvals are exact and
-the fee is in the plan's summary. Every request names this skill's version (`"skill": "1.3.0"`); without it the API
+the fee is in the plan's summary. Every request names this skill's version (`"skill": "1.4.0"`); without it the API
 answers as 1.2.0 did: the version picks the contracts and the fee a plan is built with. Beyond that nothing in a
 request can change where the output goes, the router, the fee or a spender.
 
@@ -116,8 +116,9 @@ address goes to the API, and the share URL is printed once the gift is made. A k
 - Inside a Base router's `multicall` (Aerodrome's, Aero's or Uniswap's SwapRouter02 for a token, its deadline within
   `validUntil`): one swap from the token asked to the one asked (two pools at most, through USDC or WETH), paying the
   router itself, then one fee sweep of that token to your wallet, the fee to the fee wallet at 1% with a stock token
-  or a token on either side and 0.75% otherwise. Inside Uniswap's `execute`: one hop or two through USDG, the amount asked then
-  all the router holds, no hooks, then that fee, then your wallet. Nothing is left in a router.
+  or a token on either side and 0.75% otherwise. Inside Uniswap's `execute` (Robinhood Chain, and AXIS
+  on Base): one hop or two through USDG or USDC, the amount asked then all the router holds, no hooks but AXIS/USDC's own
+  pool on Base by its whole key, then that fee, then your wallet. Nothing is left in a router.
 - The least a swap pays is the summary's `minimumOut`, above 0; a plan's deadlines are within its `validUntil`.
 - A Relay deposit is for your wallet; a send goes to the address asked; a gift goes to the wallets asked, or behind a
   link with your key, the gate (anyone, verified, your list) and times asked, the note you wrote; a take-back comes to

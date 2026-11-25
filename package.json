@@ -1,6 +1,6 @@
 {
   "name": "giftedstock-skill",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Gifted Stock for AI agents: mystery boxes, swaps of stock tokens and tokens, bridges, gift boxes and baskets on Base and Robinhood Chain from your own wallet",
   "license": "MIT",
   "type": "module",
