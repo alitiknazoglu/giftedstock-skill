@@ -253,6 +253,7 @@ A Bankr wallet (https://bankr.bot) signs and sends each step for you: Bankr hold
 
 - Up to 200 sealed boxes your wallet holds, less than a year old. Leave `ids` out to open every sealed box of that kind the wallet holds, up to 200: `{ "wallet": "0xYou", "skill": "1.4.0", "chain": "base", "box": "normal" }`. The plan's `summary.ids` names them; `nothing_to_open` (404) when there is none. Opening sends a small fee in ETH (`openFeeEth` in `/boxes`).
 - A box goes `sealed` → `opening` → `opened` within seconds: each batch settles once its random number is in (Base: Pyth Entropy; Robinhood Chain: drand, 4-7 seconds from the open). Read the prize with `GET /box/{chain}/{box}/{id}`.
+- An opened box can be burned by its holder to clear it out of the wallet: `burnOpened(uint256[] tokenIds)` on the box, opened or expired boxes only, up to 200 a call (since 2026-11-26). The prize stays in the wallet. `GET /box/{chain}/{box}/{id}` still answers for a burned box, with `owner: null` and `burned: true`; `GET /wallet/{address}` no longer lists it.
 
 ### A box that stays opening
 

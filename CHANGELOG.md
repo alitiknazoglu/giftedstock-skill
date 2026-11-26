@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 note - 2026-11-26
+
+- Opened boxes can be burned by their holder (`burnOpened` on all four boxes since 2026-11-26). `GET /box/{chain}/{box}/{id}`
+  answers a burned box with `owner: null` and `burned: true`, its prize as it was; `GET /wallet/{address}` lists only the
+  boxes still in the wallet. No request changes: send `"skill": "1.4.0"` as before.
+
 ## 1.4.0 - 2026-11-25
 
 - AXIS on Base swaps through its Uniswap v4 pool, where its market is: through Uniswap's Universal Router on Base
