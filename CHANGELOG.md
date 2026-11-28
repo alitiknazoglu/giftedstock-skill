@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.5.0 - 2026-11-27
+
+- **Campaigns.** An agent runs a Gifted Stock partner page and its campaigns from its own wallet, as a partner does on the
+  site: the partner fee, the page, a campaign with its tasks and box prize, its launch through the campaign vault, more
+  winners, a cancel before it starts, boxes back from the pool and managers. SKILL.md's Campaigns section has every step.
+  - The campaign vault (`0xc5Fefb7D57c5D58DbC1E6C8D0B637C15F1cAb1Af`, the same on Base and Robinhood Chain) is pinned as
+    `campaignVault`, with only `createPartner`, `buy`, `buyAndLaunch`, `launch`, `buyAndRaise`, `raise`, `cancel`,
+    `withdraw`, `setPartnerManager`, `claimFirstCome` and `claimRaffle`.
+  - An agent token: `GET`/`POST /api/agent/v1/session` (Sign-In with Ethereum, its own statement) answers a token for 24
+    hours, sent as `Authorization: Bearer` to the site's partner routes and to `POST /api/agent/v1/tx/partner` and
+    `tx/campaign`. `DELETE` signs the wallet out everywhere. Sensitive partner routes still ask the wallet to sign a
+    confirmation (428).
+  - `verify.mjs` checks each vault step against the request and the chain: the partner is one your wallet owns or
+    manages (read on the vault), a launch's box, boxes, boxes a winner and style are the prize asked, a raise adds the
+    winners asked, payments are no more than the vault's own quotes (`partnerFeeQuote`, `buyQuote`,
+    `campaignFeeQuote`) with one exact approval, take-backs go to your wallet, and only the owner cancels, takes boxes
+    back and names managers.
+  - `examples/giftedstock.mjs`: `login`, `logout`, `partner`, `campaign`, `call` (a partner, campaign or verify route,
+    signing its 428 after your yes), `upload` (a banner or logo) and `join`.
+- **Join campaigns.** An agent's wallet takes part like anyone's: it checks the tasks
+  (`/api/campaign/<code>/task/<id>/click` and `/verify`), joins (`/join`, a signed line) and claims what it wins with
+  `tx/campaign` `{ "action": "claim" }` (`claimFirstCome` or `claimRaffle`, pinned too; nothing paid but gas). The agent
+  token proves the wallet on these routes and on `/api/verify/ethos` and `/nft`. `GET /api/agent/v1/verify?wallet=` says
+  whether a wallet may join verified-only campaigns and each way to get there; SKILL.md's "Verify yourself" lists them.
+- **Make a basket.** `POST /api/agent/v1/tx/basket/create` `{ name, items: [{ token, usd }], payWith }` with the agent
+  token reserves a basket for your wallet (a random box, no text) and plans its first box; it goes live when that box
+  lands (`POST /api/basket/record { tx }`). `verify.mjs` checks it as a gift to your own wallet of the items asked, with
+  the basket's tag, no text on the box and the app-fee share to the fee wallet. The runner: `basket/create`, and it
+  prints the ids of the boxes a buy, a gift, a basket or a claim makes.
+- **A bridge's payout is checked.** A bridge plan carries Relay's order (`summary.route.order`), and the deposit's id is
+  that order's EIP-712 hash (Relay's settlement SDK, `getOrderId`). `verify.mjs` recomputes the hash and stops unless it
+  is the deposit's id and the order takes exactly the deposit, pays only your wallet on the other chain in the token
+  asked at least `summary.to.minimumOut`, makes no calls there and refunds only your wallet. A bridge plan without the
+  order stops. Before, only the deposit was checked: a plan whose deposit funded another order passed. Found in Bankr's
+  review of BankrBot/skills#859.
+- Run the `verify.mjs` installed with the skill, from its own folder, never a fresh clone of the default branch: it
+  moves, and its verifier is not the one you reviewed. Without the folder, check out the exact commit you installed
+  before `npm ci`. SKILL.md and README say so.
+- Send `"skill": "1.5.0"`. Agents on 1.4.0 keep working as before; campaigns need 1.5.0.
+
 ## 1.4.0 note - 2026-11-26
 
 - Opened boxes can be burned by their holder (`burnOpened` on all four boxes since 2026-11-26). `GET /box/{chain}/{box}/{id}`

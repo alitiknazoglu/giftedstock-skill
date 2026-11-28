@@ -11,8 +11,8 @@
  *   const { ok, problems, lines, review, unchecked, expect } = await verifyPlan(plan, { wallet, request, clients });
  *
  * `ok` false: do not send. `review`: what the API resolved for you (a name to an address, a symbol to a token): check
- * it is what your human meant. `unchecked`: what this file cannot see. `expect`: what a swap or bridge must take from
- * the wallet and bring it, for a dry run to hold the plan to. The command line reads the chain through BASE_RPC_URL
+ * it is what your human meant. `unchecked`: what this file cannot see. `expect`: what a swap or bridge must take from the wallet and bring it, for a
+ * dry run to hold the plan to. The command line reads the chain through BASE_RPC_URL
  * and ROBINHOOD_RPC_URL, else each chain's public RPC; --offline checks opens, sends, claims and take-backs without it.
  *
  * 1.3.0: a gift or a basket goes through router v2 (each item on its own exchange, ETH an item) with the app-fee slot
@@ -24,13 +24,13 @@ import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   concat, createPublicClient, decodeAbiParameters, decodeFunctionData, encodeAbiParameters, encodeFunctionData,
-  erc20Abi, formatEther, formatUnits, getAddress, http, isAddress, keccak256, parseAbi, parseAbiParameters, parseUnits, toBytes,
+  erc20Abi, formatEther, formatUnits, getAddress, hashStruct, http, isAddress, keccak256, parseAbi, parseAbiParameters, parseUnits, toBytes,
   toFunctionSelector, zeroAddress, zeroHash,
 } from "viem";
 import { formatAbiItem } from "viem/utils";
 import { base, robinhood } from "viem/chains";
 
-export const VERSION = "1.4.0";
+export const VERSION = "1.5.0";
 
 // Every contract a step may be sent to or approve, besides the token being approved (SKILL.md, "Contracts a step may
 // target"). If GET /api/agent/v1 ever names others, this file is right and the API is not: stop.
@@ -47,6 +47,8 @@ export const PINNED = {
     uniswapRouter: "0xd6145b2D3F379919E8CdEda7B97e37c4b2Ca9c40",
     permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
     relayDepository: "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
+    // 1.5.0: partners and campaigns (the campaign vault, the same address on both chains)
+    campaignVault: "0xc5Fefb7D57c5D58DbC1E6C8D0B637C15F1cAb1Af",
   },
   4663: {
     normalBox: "0xB669dF5aB27db31c20696743e9C78951c863c1Ca",
@@ -54,6 +56,7 @@ export const PINNED = {
     uniswapRouter: "0x204FAca1764B154221e35c0d20aBb3c525710498",
     permit2: "0x000000000022D473030F116dDEE9F6B43aC78BA3",
     relayDepository: "0x4cD00E387622C35bDDB9b4c962C136462338BC31",
+    campaignVault: "0xc5Fefb7D57c5D58DbC1E6C8D0B637C15F1cAb1Af",
   },
 };
 /** Each chain's money (6 decimals) and its WETH, which swaps trade ETH as. */
@@ -97,7 +100,6 @@ const ROUTER_ITSELF = "0x0000000000000000000000000000000000000002";
 const ALL = 1n << 255n;
 /** A gift link for verified wallets names this rule as its gate. */
 const VERIFIED_RULE = keccak256(toBytes("gifted-stock verified v1"));
-const RELAY_STATUS = "https://api.relay.link/intents/status/v3?requestId=";
 const CHAIN_ID = { base: 8453, robinhood: 4663 };
 const CHAIN_NAME = { 8453: "Base", 4663: "Robinhood Chain" };
 const DAY = 86_400;
@@ -161,6 +163,31 @@ const relayAbi = parseAbi([
   "function depositErc20(address depositor, address token, uint256 amount, bytes32 id)",
 ]);
 const approveAbi = parseAbi(["function approve(address spender, uint256 amount)"]);
+// the campaign vault (1.5.0): a partner's fee, its pool, its campaigns and its managers - nothing else of it
+const PAYMENT = "(bool inEth,uint256 maxUsdc,uint256 permitDeadline,bytes permitSig)";
+const TERMS = "(uint64 partnerId,address box,uint8 style,uint32 perWinner,uint40 startsAt,uint40 endsAt,bytes32 ref)";
+const vaultAbi = parseAbi([
+  `function createPartner(address owner_, ${PAYMENT} pay) payable returns (uint64)`,
+  `function buy(uint64 partnerId, address box, uint32 qty, ${PAYMENT} pay) payable`,
+  `function buyAndLaunch(${TERMS} t, uint32 qty, ${PAYMENT} pay) payable returns (uint64)`,
+  `function launch(${TERMS} t, uint32 count, ${PAYMENT} pay) payable returns (uint64)`,
+  `function buyAndRaise(uint64 campaignId, uint32 qty, ${PAYMENT} pay) payable`,
+  `function raise(uint64 campaignId, uint32 count, ${PAYMENT} pay) payable`,
+  "function cancel(uint64 campaignId, uint32 max) returns (uint256)",
+  "function withdraw(uint64 partnerId, address box, uint32 count, address to) returns (uint256[])",
+  "function setPartnerManager(uint64 partnerId, address wallet, bool on)",
+  "function claimFirstCome(uint64 campaignId, uint32 total, uint256 deadline, bytes signature, uint32 max, address to) returns (uint256[])",
+  "function claimRaffle(uint64 campaignId, uint32 total, bytes32[] proof, uint32 max, address to) returns (uint256[])",
+]);
+const vaultReadAbi = parseAbi([
+  "function partnerOf(uint64 partnerId) view returns ((address owner,address pendingOwner,uint40 createdAt,bool blocked))",
+  "function isPartnerManager(uint64 partnerId, address wallet) view returns (bool)",
+  "function campaign(uint64 campaignId) view returns ((uint64 partnerId,address box,uint8 style,bool published,bool closed,bool cancelled,uint32 perWinner,uint32 boxes,uint32 owed,uint40 startsAt,uint40 endsAt,uint40 claimUntil,bytes32 ref,bytes32 winnersRoot))",
+  "function partnerFeeQuote() view returns (uint256 usdcUnits, uint256 wei_)",
+  "function campaignFeeQuote(address box, uint256 count) view returns (uint256 usdcUnits, uint256 wei_)",
+  "function buyQuote(address box, uint256 qty) view returns (uint256 usdcUnits, uint256 wei_)",
+  "function pool(uint64 partnerId, address box) view returns (uint32 count, (uint64 start,uint32 count,uint32 mintedAt)[] ranges)",
+]);
 // reads
 const boxReadAbi = parseAbi(["function price() view returns (uint256)", "function mintPriceWei(uint256 qty) view returns (uint256)", "function ownerOf(uint256 id) view returns (address)"]);
 const batchOwnerAbi = parseAbi(["function batchOf(uint256 batchId) view returns ((address owner,uint32 requestedAt,uint16 count,bool revealed,bool settled,bool cancelled))"]);
@@ -179,8 +206,8 @@ const v4QuoterAbi = parseAbi([
 ]);
 
 const ABI_OF = {
-  8453: { normalBox: baseBoxAbi, premiumBox: baseBoxAbi, giftBox: giftAbi, giftRouter: giftRouterAbi, aerodromeRouter: routerAbi, aeroRouter: routerAbi, uniswapRouter02: router02Abi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi },
-  4663: { normalBox: rhBoxAbi, premiumBox: rhBoxAbi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi },
+  8453: { normalBox: baseBoxAbi, premiumBox: baseBoxAbi, giftBox: giftAbi, giftRouter: giftRouterAbi, aerodromeRouter: routerAbi, aeroRouter: routerAbi, uniswapRouter02: router02Abi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi, campaignVault: vaultAbi },
+  4663: { normalBox: rhBoxAbi, premiumBox: rhBoxAbi, uniswapRouter: universalRouterAbi, permit2: permit2Abi, relayDepository: relayAbi, campaignVault: vaultAbi },
 };
 
 const sig = (abi) => abi.filter((x) => x.type === "function").map((f) => ({ signature: formatAbiItem(f), selector: toFunctionSelector(f) }));
@@ -209,16 +236,30 @@ const V4 = {
   take: "address, address, uint256",
 };
 
+/** The campaign vault's plans (1.5.0): POST tx/partner and tx/campaign, by their request's `action`. */
+/** 1.5.0: a new basket's first box, by its maker (POST tx/basket/create). */
+const BASKET_CREATE = "basket_create";
+const VAULT_ACTIONS = ["partner_create", "pool_withdraw", "partner_manager", "campaign_launch", "campaign_raise", "campaign_cancel", "campaign_claim"];
+const VAULT_ACTION_OF = { create: "partner_create", withdraw: "pool_withdraw", manager: "partner_manager", launch: "campaign_launch", raise: "campaign_raise", cancel: "campaign_cancel", claim: "campaign_claim" };
+
 /** The actions a plan can be, and which of them are checked against the chain itself. */
-export const ACTIONS = ["buy", "open", "send", "settle", "swap", "bridge", "gift_create", "gift_link_create", "basket_buy", "gift_claim", "gift_open", "gift_take_back"];
-const READS_CHAIN = new Set(["buy", "settle", "swap", "bridge", "gift_create", "gift_link_create", "basket_buy"]);
-/** The actions whose plan 1.3.0 builds differently from 1.2.0: their request must name this version. */
-const NEEDS_SKILL = new Set(["gift_create", "gift_link_create", "basket_buy"]);
+export const ACTIONS = ["buy", "open", "send", "settle", "swap", "bridge", "gift_create", "gift_link_create", "basket_buy", BASKET_CREATE, "gift_claim", "gift_open", "gift_take_back", ...VAULT_ACTIONS];
+const READS_CHAIN = new Set(["buy", "settle", "swap", "bridge", "gift_create", "gift_link_create", "basket_buy", BASKET_CREATE, ...VAULT_ACTIONS]);
+/** The actions whose plan 1.3.0 builds differently from 1.2.0 (and the vault's, 1.5.0's own): their request must name this version. */
+const NEEDS_SKILL = new Set(["gift_create", "gift_link_create", "basket_buy", BASKET_CREATE, ...VAULT_ACTIONS]);
 
 /** What a request body asks for, by its shape: the plan must be that, whatever it calls itself. */
 export function actionOf(r) {
   if (!r || typeof r !== "object") return null;
+  // the vault's requests name their action; a campaign's always name its partner page and code, a partner fee its chain
+  if (typeof r.action === "string" && Object.hasOwn(VAULT_ACTION_OF, r.action)) {
+    const kind = VAULT_ACTION_OF[r.action];
+    if (kind === "campaign_claim" ? r.code === undefined : kind.startsWith("campaign_") && (r.slug === undefined || r.code === undefined)) return null;
+    return kind;
+  }
   if (r.from && r.to && typeof r.from === "object" && typeof r.to === "object" && r.amount !== undefined) return r.from.chain === r.to.chain ? "swap" : "bridge";
+  // a new basket names itself and its items, never a recipient or a link
+  if (Array.isArray(r.items) && typeof r.name === "string" && r.to === undefined && r.link === undefined) return BASKET_CREATE;
   if (Array.isArray(r.items)) return r.link ? "gift_link_create" : "gift_create";
   if (r.basket !== undefined) return "basket_buy";
   if (r.quantity !== undefined) return "buy";
@@ -372,6 +413,103 @@ function wordsFor(pub, chainId) {
   };
 }
 
+/** What a bridge pays on the other chain: ETH or that chain's money (USDC on Base, USDG on Robinhood Chain), nothing else. */
+function bridgeTo(r, fromChainId) {
+  const chainId = CHAIN_ID[r.to?.chain];
+  if (!chainId || chainId === fromChainId) stop("a bridge goes to the other chain: request.to.chain is base or robinhood, not the one it leaves");
+  const asked = r.to?.token;
+  if (typeof asked !== "string" || !asked) stop("to names no token");
+  if (/^eth$/i.test(asked) || same(asked, zeroAddress)) return { chain: r.to.chain, address: zeroAddress, decimals: 18, symbol: "ETH" };
+  const m = MONEY[chainId];
+  if (same(asked, m.symbol) || same(asked, m.address)) return { chain: r.to.chain, address: getAddress(m.address), decimals: 6, symbol: m.symbol };
+  stop(`a bridge pays ETH or ${m.symbol} on ${CHAIN_NAME[chainId]}, not ${asked.slice(0, 60)}`);
+}
+
+/** The EIP-712 types of a Relay v1 order, as Relay's settlement SDK hashes it into the id its deposit carries
+ *  (relayprotocol/relay-settlement, packages/sdk/src/order, `getOrderId`). */
+/** The solver Relay's orders name (every quote on 27 Nov 2026, both chains, all four directions): another one goes to review. */
+const RELAY_SOLVERS = ["0xf70da97812cb96acdf810712aa562db8dfa3dbef"];
+
+const RELAY_ORDER_TYPES = {
+  Order: [{ name: "version", type: "string" }, { name: "solverChainId", type: "string" }, { name: "solver", type: "address" }, { name: "salt", type: "uint256" }, { name: "inputs", type: "Input[]" }, { name: "output", type: "Output" }, { name: "fees", type: "Fee[]" }],
+  Input: [{ name: "payment", type: "InputPayment" }, { name: "refunds", type: "InputRefund[]" }],
+  InputPayment: [{ name: "chainId", type: "string" }, { name: "currency", type: "bytes" }, { name: "amount", type: "uint256" }, { name: "weight", type: "uint256" }],
+  InputRefund: [{ name: "chainId", type: "string" }, { name: "recipient", type: "bytes" }, { name: "currency", type: "bytes" }, { name: "minimumAmount", type: "uint256" }, { name: "deadline", type: "uint32" }, { name: "extraData", type: "bytes" }],
+  Output: [{ name: "chainId", type: "string" }, { name: "payments", type: "OutputPayment[]" }, { name: "deadline", type: "uint32" }, { name: "calls", type: "bytes[]" }, { name: "extraData", type: "bytes" }],
+  OutputPayment: [{ name: "recipient", type: "bytes" }, { name: "currency", type: "bytes" }, { name: "minimumAmount", type: "uint256" }, { name: "expectedAmount", type: "uint256" }],
+  Fee: [{ name: "recipientChainId", type: "string" }, { name: "recipient", type: "bytes" }, { name: "currencyChainId", type: "string" }, { name: "currency", type: "bytes" }, { name: "amount", type: "uint256" }],
+};
+
+/**
+ * Relay's order behind a bridge's deposit (`summary.route.order`): it must hash to the deposit's id, take exactly the
+ * deposit (this chain, token and amount), pay only `me` on the other chain in the token asked at least the summary's
+ * minimum, carry no calls and refund only `me`, in what was sent or what was asked. Returns the least it pays and the
+ * solver it names.
+ */
+function relayOrder(o, id, want, n) {
+  if (!o || typeof o !== "object") stop(`${n}: the plan carries no Relay order (summary.route.order), so where the bridge pays can not be checked: do not send it`);
+  if (o.version !== "v1") stop(`${n}: Relay's order is version ${String(o.version).slice(0, 20)}, which this file does not read`);
+  const hex = (v, f) => {
+    if (typeof v !== "string" || !/^0x([0-9a-fA-F]{2})*$/.test(v)) stop(`Relay's order: ${f} is not hex`);
+    return v.toLowerCase();
+  };
+  const num = (v, f) => {
+    if (typeof v !== "string" || !/^(\d{1,78}|0x[0-9a-fA-F]{1,64})$/.test(v)) stop(`Relay's order: ${f} is not a number`);
+    return BigInt(v);
+  };
+  const u32 = (v, f) => {
+    if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) stop(`Relay's order: ${f} is not a time`);
+    return v;
+  };
+  const str = (v, f) => {
+    if (typeof v !== "string") stop(`Relay's order: ${f} is missing`);
+    return v;
+  };
+  const list = (v, f) => {
+    if (!Array.isArray(v)) stop(`Relay's order: ${f} is not a list`);
+    return v;
+  };
+  const out = o.output ?? {};
+  const data = {
+    version: "v1",
+    solverChainId: str(o.solverChainId, "solverChainId"),
+    solver: isAddr(o.solver) ? getAddress(o.solver) : stop("Relay's order: solver is not an address"),
+    salt: num(o.salt, "salt"),
+    inputs: list(o.inputs, "inputs").map((i) => ({
+      payment: { chainId: str(i?.payment?.chainId, "payment.chainId"), currency: hex(i?.payment?.currency, "payment.currency"), amount: num(i?.payment?.amount, "payment.amount"), weight: num(i?.payment?.weight, "payment.weight") },
+      refunds: list(i?.refunds, "refunds").map((x) => ({ chainId: str(x?.chainId, "refund.chainId"), recipient: hex(x?.recipient, "refund.recipient"), currency: hex(x?.currency, "refund.currency"), minimumAmount: num(x?.minimumAmount, "refund.minimumAmount"), deadline: u32(x?.deadline, "refund.deadline"), extraData: hex(x?.extraData, "refund.extraData") })),
+    })),
+    output: {
+      chainId: str(out.chainId, "output.chainId"),
+      payments: list(out.payments, "output.payments").map((p) => ({ recipient: hex(p?.recipient, "payment.recipient"), currency: hex(p?.currency, "payment.currency"), minimumAmount: num(p?.minimumAmount, "payment.minimumAmount"), expectedAmount: num(p?.expectedAmount, "payment.expectedAmount") })),
+      deadline: u32(out.deadline, "output.deadline"),
+      calls: list(out.calls, "output.calls").map((x) => hex(x, "output.calls")),
+      extraData: hex(out.extraData, "output.extraData"),
+    },
+    fees: list(o.fees ?? [], "fees").map((f) => ({ recipientChainId: str(f?.recipientChainId, "fee.recipientChainId"), recipient: hex(f?.recipient, "fee.recipient"), currencyChainId: str(f?.currencyChainId, "fee.currencyChainId"), currency: hex(f?.currency, "fee.currency"), amount: num(f?.amount, "fee.amount") })),
+  };
+  if (!same(hashStruct({ types: RELAY_ORDER_TYPES, primaryType: "Order", data }), id)) stop(`${n} deposits for Relay order ${id}, and the order in the plan is another: do not send it`);
+  // what it takes: exactly the deposit
+  if (data.inputs.length !== 1) stop(`Relay's order takes ${data.inputs.length} payments, not the one deposit`);
+  const [input] = data.inputs;
+  if (input.payment.chainId !== want.from.chain || !same(input.payment.currency, want.from.address) || input.payment.amount !== want.amount) stop("Relay's order takes another chain, token or amount than the deposit");
+  // where it refunds: only you, in what you sent or what you asked for
+  for (const x of input.refunds) {
+    if (!same(x.recipient, want.me)) stop(`Relay's order refunds ${x.recipient}, not your wallet`);
+    const ok = (x.chainId === want.from.chain && same(x.currency, want.from.address)) || (x.chainId === want.to.chain && same(x.currency, want.to.address));
+    if (!ok) stop(`Relay's order refunds in ${x.currency} on ${x.chainId}, not in what you sent or asked for`);
+  }
+  // what it pays: only you, on the chain and in the token asked, at least the summary's minimum, with no calls
+  if (data.output.chainId !== want.to.chain) stop(`Relay's order pays on ${data.output.chainId}, not ${want.to.chain}`);
+  if (data.output.calls.length) stop("Relay's order makes calls on the other chain");
+  if (data.output.payments.length !== 1) stop(`Relay's order makes ${data.output.payments.length} payments, not one to your wallet`);
+  const [p] = data.output.payments;
+  if (!same(p.recipient, want.me)) stop(`Relay's order pays ${p.recipient}, not your wallet`);
+  if (!same(p.currency, want.to.address)) stop(`Relay's order pays in ${p.currency}, not ${want.to.symbol}`);
+  if (p.minimumAmount < want.min) stop(`Relay's order guarantees ${formatUnits(p.minimumAmount, want.to.decimals)} ${want.to.symbol}, under the summary's minimumOut`);
+  return { min: p.minimumAmount, solver: data.solver };
+}
+
 /**
  * The token a request names: ETH and the chain's money by name, anything else by its address or by the symbol the
  * token itself answers on the chain. A token the API picked for a symbol goes to `review`: a look-alike can carry any
@@ -391,7 +529,8 @@ async function tokenOf(c, asked, claimed, field) {
     c.pub.readContract({ address, abi: erc20Abi, functionName: "decimals" }),
     c.pub.readContract({ address, abi: erc20Abi, functionName: "symbol" }),
   ]);
-  if (!byAddress && !same(symbol, asked)) stop(`${field}: ${address} is ${symbol}, not ${asked}`);
+  // on Base a stock's ticker finds its tokenized stock ("NVDA" is NVDAc), as the API and a Swap tab link take it
+  if (!byAddress && !same(symbol, asked) && !(c.chainId === 8453 && same(symbol, `${asked}c`))) stop(`${field}: ${address} is ${symbol}, not ${asked}`);
   if (!byAddress) c.review.push(`${field}: the API says ${asked} is ${address}: check it against a list you trust (Coinbase's tokenized stocks on Base, Robinhood's stock token registry on Robinhood Chain, a token's own site)`);
   return { address, decimals: Number(decimals), symbol, kind: "stock" };
 }
@@ -416,7 +555,10 @@ export async function verifyPlan(plan, { wallet, request, action, linkKeyAddress
     if (NEEDS_SKILL.has(kind) && request.skill !== VERSION) stop(`send "skill": "${VERSION}" with the request: without it the API answers as skill 1.2.0, through a router this file does not pin`);
     if (!plan || typeof plan !== "object" || !Array.isArray(plan.steps) || plan.steps.length === 0) stop("the plan has no steps");
     if (plan.action !== kind) stop(`you asked for ${an(kind)} and the plan is ${an(String(plan.action))}`);
-    const chainName = kind === "swap" || kind === "bridge" ? request.from?.chain : kind.startsWith("gift") || kind === "basket_buy" ? "base" : request.chain;
+    // a launch's chain is the prize's; every other vault action names its own (never the plan's word: security review,
+    // 27 Nov 2026)
+    const chainName = kind === "swap" || kind === "bridge" ? request.from?.chain : kind.startsWith("gift") || kind === "basket_buy" ? "base"
+      : kind === "campaign_launch" ? request.prize?.chain : kind === BASKET_CREATE ? "base" : request.chain;
     const chainId = CHAIN_ID[chainName];
     if (!chainId) stop("the request names no chain (base or robinhood)");
     if (plan.validUntil !== undefined && !(typeof plan.validUntil === "number" && Number.isSafeInteger(plan.validUntil))) stop("the plan's validUntil is not unix seconds");
@@ -537,6 +679,7 @@ const CHECKS = {
     const r = c.request;
     const from = await tokenOf(c, r.from.token, null, "from");
     if (from.kind === "stock") stop("a bridge moves USDC, USDG or ETH");
+    const to = bridgeTo(r, c.chainId);
     const amount = units(r.amount, from.decimals, "request.amount");
     if (amount === 0n) stop("request.amount is 0");
     if (c.plan.validUntil === undefined) stop("a bridge plan has a validUntil");
@@ -561,14 +704,42 @@ const CHECKS = {
       }
       id = last.args[3];
     }
+    // the payout: the deposit's id is Relay's order's EIP-712 hash, so the order the plan carries is the one this deposit
+    // funds, and it is checked here, not taken on Relay's or the API's word (Bankr review of BankrBot/skills#859, 27 Nov
+    // 2026: before, only the deposit was checked and a plan whose deposit funded another order passed)
+    const min = units(c.plan.summary?.to?.minimumOut, to.decimals, "summary.to.minimumOut");
+    if (min === 0n) stop("the summary's minimumOut is 0");
+    const { min: paid, solver } = relayOrder(c.plan.summary?.route?.order, id, { me: c.me, from: { chain: r.from.chain, address: from.address }, to, amount, min }, last.n);
+    // the order's solver fills or refunds it: one Relay's quotes never name could refund nothing (its refunds' minimum is
+    // 0), so it waits for your human (security review, 27 Nov 2026)
+    if (!RELAY_SOLVERS.some((x) => same(x, solver))) c.review.push(`Relay's order names solver ${solver}, not the one Relay's quotes name: build the plan again, or check with Relay it is theirs`);
     c.out.expect = { spend: [{ token: from.address, amount }], gain: [] };
-    c.lines.push(`${last.n}: deposit ${await c.words(from.address, amount)} with Relay; a refund comes back to your wallet; Relay request ${id}`);
-    c.unchecked.push(`the payout on the other chain: Relay's request ${id} carries where it goes and how much. Look it up with Relay itself (${RELAY_STATUS}${id}), not through a link from the plan`);
+    c.lines.push(`${last.n}: deposit ${await c.words(from.address, amount)} with Relay for its order ${id}: at least ${formatUnits(paid, to.decimals)} ${to.symbol} to your wallet on ${CHAIN_NAME[CHAIN_ID[to.chain]]}, refunds only to your wallet`);
+    c.unchecked.push("whether the minimum is a fair price: compare summary.to.minimumOut with a price you trust");
   },
 
   gift_create: (c) => gift(c, false),
   gift_link_create: (c) => gift(c, true),
   basket_buy: (c) => basket(c),
+
+  // a new basket's first box: a gift to your own wallet of the items asked, the basket's tag as its note, no text on the
+  // box, the app-fee slot the fee wallet's (you make it); the gift check itself, with that request
+  async basket_create(c) {
+    const r = c.request;
+    const sb = c.plan.summary?.basket ?? {};
+    if (typeof sb.code !== "string" || !/^(?=[a-z0-9]*\d)[a-z0-9]{5}$/.test(sb.code)) stop("the summary names no basket code");
+    if (!same(sb.maker, c.me)) stop(`the summary names ${String(sb.maker).slice(0, 42)} as the new basket's maker, not your wallet`);
+    if (sb.firstBox !== true) stop("the plan is not a new basket's first box");
+    if (!Array.isArray(r.items) || r.items.length < 2 || r.items.length > 20) stop("a basket holds 2 to 20 tokens");
+    const asked = { ...r, to: [c.me], note: `basket:${sb.code}`, design: c.plan.summary?.design };
+    delete asked.name;
+    const inner = { ...c, request: asked };
+    await gift(inner, false);
+    const last = c.steps.at(-1);
+    if (titleOf(last.args[4].design)) stop(`${last.n} writes "${titleOf(last.args[4].design)}" on the box: a basket's box carries no text`);
+    if (last.args[2] !== 1) stop(`${last.n} makes ${last.args[2]} boxes: a new basket's first box is one`);
+    c.lines.push(`this is the first box of your new basket ${sb.code}${typeof r.name === "string" ? ` ("${clean(r.name, 24)}")` : ""}: it goes live with it at ${SITE}/basket/${sb.code}`);
+  },
 
   async gift_claim(c) {
     steps(c, 1, 1);
@@ -595,7 +766,255 @@ const CHECKS = {
     if (!same(s.args[2], c.me)) stop(`${s.n} takes boxes back to ${s.args[2]}, not your wallet`);
     c.lines.push(`${s.n}: take back ${s.args[1]} unclaimed box(es) from link ${s.args[0]}`);
   },
+
+  // ── the campaign vault (1.5.0) ─────────────────────────────────────────────────────────────────────────────────
+  async partner_create(c) {
+    const r = c.request;
+    if (CHAIN_ID[r.chain] !== c.chainId) stop("request.chain is base or robinhood");
+    const last = c.steps.at(-1);
+    steps(c, 1, 2);
+    if (c.steps.length === 2 && c.steps[0].kind !== "approve") stop(`${c.steps[0].n} is not an approval`);
+    call(last, ["campaignVault"], ["createPartner"], "createPartner on the campaign vault");
+    if (!same(last.args[0], c.me)) stop(`${last.n} makes a partner for ${last.args[0]}, not your wallet`);
+    const [u, w] = await vaultRead(c, "partnerFeeQuote");
+    await vaultPays(c, [{ s: last, pay: last.args[1], quote: { units: u, wei: w } }]);
+    c.lines.push(`${last.n}: create your partner on the ${CHAIN_NAME[c.chainId]} campaign vault, run by your wallet${u ? `, the partner fee ${formatUnits(u, 6)} ${MONEY[c.chainId].symbol}${last.args[1].inEth ? " in ETH" : ""}` : ", no fee"}`);
+  },
+
+  async campaign_launch(c) {
+    const p = c.request.prize;
+    if (!p || typeof p !== "object") stop("request.prize is missing: { chain, box, boxes, perWinner, style } as you saved the campaign");
+    const box = boxAddress(c, p.box, "request.prize.box");
+    const boxes = int(p.boxes, "request.prize.boxes");
+    const perWinner = int(p.perWinner, "request.prize.perWinner");
+    if (p.style !== "raffle" && p.style !== "fcfs") stop('request.prize.style is "raffle" or "fcfs"');
+    const style = p.style === "raffle" ? 1 : 0;
+    const last = c.steps.at(-1);
+    call(last, ["campaignVault"], ["launch", "buyAndLaunch"], "a launch on the campaign vault");
+    const [t, n, pay] = last.args;
+    if (!same(t.box, box)) stop(`${last.n} launches ${t.box}, not the ${p.box} box`);
+    if (t.style !== style) stop(`${last.n} launches a ${t.style === 1 ? "raffle" : "first-come"} campaign, not ${p.style}`);
+    if (BigInt(t.perWinner) !== perWinner) stop(`${last.n} gives ${t.perWinner} boxes a winner, not ${perWinner}`);
+    if (BigInt(n) !== boxes) stop(`${last.n} launches ${n} boxes, not the ${boxes} of the prize`);
+    if (t.partnerId !== askedId(c.request, "partnerId")) stop(`${last.n} launches for partner #${t.partnerId}, not #${c.request.partnerId}`);
+    // the dates as saved: the end exactly, the start as saved or - one already past - the moment the plan was built
+    const ends = Math.floor(Date.parse(p.endsAt) / 1000);
+    const starts = Math.floor(Date.parse(p.startsAt) / 1000);
+    if (!Number.isSafeInteger(ends) || !Number.isSafeInteger(starts)) stop("request.prize.startsAt and endsAt are the campaign's dates as saved (ISO 8601)");
+    if (t.endsAt !== ends) stop(`${last.n}'s campaign ends ${new Date(t.endsAt * 1000).toISOString()}, not ${p.endsAt}`);
+    if (t.startsAt < starts || t.startsAt > Math.max(starts, c.now + 600)) stop(`${last.n}'s campaign starts ${new Date(t.startsAt * 1000).toISOString()}, not as saved (${p.startsAt})`);
+    if (!(t.endsAt > c.now)) stop(`${last.n}'s campaign has already ended`);
+    if (!(t.startsAt < t.endsAt)) stop(`${last.n}'s campaign starts after it ends`);
+    // the window itself, as the site keeps it (a start can be any time ahead: bug review, 27 Nov 2026)
+    if (t.endsAt - Math.max(t.startsAt, c.now) > 30 * DAY + 3_600) stop(`${last.n}'s campaign runs over 30 days`);
+    const who = await runsPartner(c, t.partnerId, last.n);
+    // what the launch takes from the pool and what is bought for it: buys into this partner's pool of this box, 200 a call
+    const buys = c.steps.slice(0, -1).filter((s) => s.kind === "call");
+    const approve = c.steps.slice(0, -1).filter((s) => s.kind === "approve");
+    if (approve.length > 1 || (approve.length && c.steps[0] !== approve[0])) stop("a launch has one approval at most, first");
+    let bought = 0n;
+    const quoted = [];
+    for (const b of buys) {
+      call(b, ["campaignVault"], ["buy"], "a buy into your pool");
+      if (b.args[0] !== t.partnerId || !same(b.args[1], box)) stop(`${b.n} buys into another partner's pool or another box`);
+      if (b.args[2] < 1 || b.args[2] > 200) stop(`${b.n} buys ${b.args[2]} boxes: one call buys 1 to 200`);
+      bought += BigInt(b.args[2]);
+      const [u, w] = await vaultRead(c, "buyQuote", [box, BigInt(b.args[2])]);
+      quoted.push({ s: b, pay: b.args[3], quote: { units: u, wei: w } });
+    }
+    if (bought > boxes) stop(`the plan buys ${bought} boxes for a prize of ${boxes}`);
+    if (last.fn === "buyAndLaunch") {
+      if (buys.length) stop(`${last.n} buys its boxes itself: no buys before it`);
+      const [bu, bw] = await vaultRead(c, "buyQuote", [box, BigInt(n)]);
+      const [fu, fw] = await vaultRead(c, "campaignFeeQuote", [box, BigInt(n)]);
+      quoted.push({ s: last, pay, quote: { units: bu + fu, wei: bw + fw } });
+    } else {
+      const [fu, fw] = await vaultRead(c, "campaignFeeQuote", [box, BigInt(n)]);
+      quoted.push({ s: last, pay, quote: { units: fu, wei: fw } });
+    }
+    await vaultPays(c, quoted);
+    const fresh = last.fn === "buyAndLaunch" ? BigInt(n) : bought;
+    c.lines.push(`${last.n}: launch a ${p.style === "raffle" ? "raffle" : "first-come"} campaign of ${n} ${p.box} boxes, ${t.perWinner} a winner, ${new Date(t.startsAt * 1000).toISOString()} to ${new Date(t.endsAt * 1000).toISOString()}, for partner #${t.partnerId} (${who}); ${fresh} bought, ${BigInt(n) - fresh} from your pool`);
+    c.unchecked.push("the campaign's name, text and tasks: they live on the site, not on the chain (GET your campaign to read them)");
+    c.unchecked.push("the launch's ref, which ties it to the campaign on the site: if the site does not count the launch, ask us - never launch it again");
+  },
+
+  async campaign_raise(c) {
+    const more = int(c.request.winners, "request.winners");
+    const last = c.steps.at(-1);
+    call(last, ["campaignVault"], ["raise", "buyAndRaise"], "a raise on the campaign vault");
+    const [id, n, pay] = last.args;
+    if (id !== askedId(c.request, "campaignId")) stop(`${last.n} raises campaign ${id}, not #${c.request.campaignId}`);
+    const k = await vaultRead(c, "campaign", [id]);
+    if (k.partnerId === 0n) stop(`${last.n} raises campaign ${id}, which is not on this vault`);
+    if (k.partnerId !== askedId(c.request, "partnerId")) stop(`${last.n} raises a campaign of partner #${k.partnerId}, not #${c.request.partnerId}`);
+    const who = await runsPartner(c, k.partnerId, last.n);
+    if (BigInt(n) !== more * BigInt(k.perWinner)) stop(`${last.n} adds ${n} boxes, not ${more} winner(s) of ${k.perWinner}`);
+    const box = k.box;
+    const buys = c.steps.slice(0, -1).filter((s) => s.kind === "call");
+    const approve = c.steps.slice(0, -1).filter((s) => s.kind === "approve");
+    if (approve.length > 1 || (approve.length && c.steps[0] !== approve[0])) stop("a raise has one approval at most, first");
+    let bought = 0n;
+    const quoted = [];
+    for (const b of buys) {
+      call(b, ["campaignVault"], ["buy"], "a buy into your pool");
+      if (b.args[0] !== k.partnerId || !same(b.args[1], box)) stop(`${b.n} buys into another partner's pool or another box`);
+      if (b.args[2] < 1 || b.args[2] > 200) stop(`${b.n} buys ${b.args[2]} boxes: one call buys 1 to 200`);
+      bought += BigInt(b.args[2]);
+      const [u, w] = await vaultRead(c, "buyQuote", [box, BigInt(b.args[2])]);
+      quoted.push({ s: b, pay: b.args[3], quote: { units: u, wei: w } });
+    }
+    if (bought > BigInt(n)) stop(`the plan buys ${bought} boxes for a raise of ${n}`);
+    if (last.fn === "buyAndRaise") {
+      if (buys.length) stop(`${last.n} buys its boxes itself: no buys before it`);
+      const [bu, bw] = await vaultRead(c, "buyQuote", [box, BigInt(n)]);
+      const [fu, fw] = await vaultRead(c, "campaignFeeQuote", [box, BigInt(n)]);
+      quoted.push({ s: last, pay, quote: { units: bu + fu, wei: bw + fw } });
+    } else {
+      const [fu, fw] = await vaultRead(c, "campaignFeeQuote", [box, BigInt(n)]);
+      quoted.push({ s: last, pay, quote: { units: fu, wei: fw } });
+    }
+    await vaultPays(c, quoted);
+    c.lines.push(`${last.n}: add ${more} winner(s), ${n} boxes, to campaign ${id} of partner #${k.partnerId} (${who})`);
+  },
+
+  async campaign_cancel(c) {
+    steps(c, 1, 1);
+    const s = call(c.steps[0], ["campaignVault"], ["cancel"], "a cancel on the campaign vault");
+    noEth(s);
+    const [id, max] = s.args;
+    if (max !== 0) stop(`${s.n} cancels only part of campaign ${id}`);
+    if (id !== askedId(c.request, "campaignId")) stop(`${s.n} cancels campaign ${id}, not #${c.request.campaignId}`);
+    const k = await vaultRead(c, "campaign", [id]);
+    if (k.partnerId === 0n) stop(`${s.n} cancels campaign ${id}, which is not on this vault`);
+    if (k.partnerId !== askedId(c.request, "partnerId")) stop(`${s.n} cancels a campaign of partner #${k.partnerId}, not #${c.request.partnerId}`);
+    if ((await runsPartner(c, k.partnerId, s.n)) !== "yours") stop(`${s.n} cancels a campaign of partner #${k.partnerId}, which your wallet does not own`);
+    c.lines.push(`${s.n}: cancel campaign ${id} of your partner #${k.partnerId}: its ${k.boxes} boxes go back to your pool`);
+  },
+
+  async campaign_claim(c) {
+    const asked = askedId(c.request, "campaignId");
+    let total = 0n;
+    for (const s of c.steps) {
+      call(s, ["campaignVault"], ["claimFirstCome", "claimRaffle"], "a claim on the campaign vault");
+      noEth(s);
+      const id = s.args[0];
+      const to = s.args.at(-1);
+      const max = s.args.at(-2);
+      if (id !== asked) stop(`${s.n} claims from campaign ${id}, not #${c.request.campaignId}`);
+      if (!same(to, zeroAddress) && !same(to, c.me)) stop(`${s.n} sends the boxes to ${to}, not your wallet`);
+      if (max < 1 || max > 200) stop(`${s.n} claims ${max} boxes: one call takes 1 to 200`);
+      total += BigInt(max);
+    }
+    const k = await vaultRead(c, "campaign", [asked]);
+    if (k.partnerId === 0n) stop(`campaign ${asked} is not on this vault`);
+    c.lines.push(`claim up to ${total} box${total === 1n ? "" : "es"} of campaign ${asked} on ${CHAIN_NAME[c.chainId]} to your wallet; nothing is paid but gas`);
+  },
+
+  async pool_withdraw(c) {
+    const r = c.request;
+    if (CHAIN_ID[r.chain] !== c.chainId) stop("request.chain is base or robinhood");
+    const box = boxAddress(c, r.box, "request.box");
+    const count = int(r.count, "request.count");
+    let id = null;
+    let total = 0n;
+    for (const s of c.steps) {
+      call(s, ["campaignVault"], ["withdraw"], "a take-back from your pool");
+      noEth(s);
+      const [pid, b, k, to] = s.args;
+      if (id !== null && pid !== id) stop(`${s.n} takes from another partner's pool`);
+      id = pid;
+      if (!same(b, box)) stop(`${s.n} takes ${b}, not the ${r.box} box`);
+      if (!same(to, c.me)) stop(`${s.n} sends the boxes to ${to}, not your wallet`);
+      if (k < 1 || k > 200) stop(`${s.n} takes ${k} boxes: one call takes 1 to 200`);
+      total += BigInt(k);
+    }
+    if (total !== count) stop(`the plan takes ${total} boxes back, not ${count}`);
+    if (id !== askedId(r, "partnerId")) stop(`the plan takes boxes from partner #${id}'s pool, not #${r.partnerId}`);
+    if ((await runsPartner(c, id, "the plan")) !== "yours") stop(`partner #${id} is not your wallet's: only its owner takes boxes back`);
+    c.lines.push(`take ${count} ${r.box} boxes from your partner #${id}'s pool back to your wallet`);
+  },
+
+  async partner_manager(c) {
+    const r = c.request;
+    if (CHAIN_ID[r.chain] !== c.chainId) stop("request.chain is base or robinhood");
+    steps(c, 1, 1);
+    const s = call(c.steps[0], ["campaignVault"], ["setPartnerManager"], "setPartnerManager on the campaign vault");
+    noEth(s);
+    const [id, wallet, on] = s.args;
+    if (id !== askedId(r, "partnerId")) stop(`${s.n} is for partner #${id}, not #${r.partnerId}`);
+    if (!isAddr(r.manager) || !same(wallet, r.manager)) stop(`${s.n} names ${wallet}, not the manager asked`);
+    if (on !== r.on) stop(`${s.n} ${on ? "names" : "removes"} the manager, not what was asked`);
+    if ((await runsPartner(c, id, s.n)) !== "yours") stop(`partner #${id} is not your wallet's: only its owner names managers`);
+    c.lines.push(`${s.n}: ${on ? "name" : "remove"} ${wallet} as a manager of your partner #${id}`);
+  },
 };
+
+/**
+ * The vault ids a request names, as the chain gave them to you (security review, 27 Nov 2026: a plan for another partner
+ * your wallet merely manages, or another campaign of yours, passed): `partnerId` from your createPartner receipt's
+ * PartnerCreated (or the partner's vault page), `campaignId` from the launch receipt's CampaignLaunched.
+ */
+function askedId(r, field) {
+  const v = r?.[field];
+  if (v === undefined || v === null || v === "") stop(`request.${field} is missing: the vault id as your receipt gave it`);
+  return int(v, `request.${field}`);
+}
+
+/** A view of the campaign vault on the plan's chain. */
+const vaultRead = (c, functionName, args = []) => c.pub.readContract({ address: PINNED[c.chainId].campaignVault, abi: vaultReadAbi, functionName, args });
+
+/** The box contract a request names ("normal" or "premium") on the plan's chain: the vault holds the same four boxes. */
+function boxAddress(c, asked, field) {
+  if (asked !== "normal" && asked !== "premium") stop(`${field} is "normal" or "premium"`);
+  return PINNED[c.chainId][asked === "premium" ? "premiumBox" : "normalBox"];
+}
+
+/** Whether your wallet runs partner `id` on this chain: "yours" (its owner) or "you manage it"; anything else stops. */
+async function runsPartner(c, id, n) {
+  const p = await vaultRead(c, "partnerOf", [id]);
+  if (same(p.owner, c.me)) return "yours";
+  if (await vaultRead(c, "isPartnerManager", [id, c.me])) return "you manage it";
+  stop(`${n} is for partner #${id}, which your wallet neither owns nor manages on ${CHAIN_NAME[c.chainId]}`);
+}
+
+/**
+ * Each vault call's payment against the vault's own quote read now: in the chain's dollar, maxUsdc no more than the quote
+ * (and 1% for a box price the owner moves) and no ETH sent, all of them covered by one exact approval first; in ETH,
+ * the value no more than the quote's ETH and 3% (the plan adds 1%, the price moves; the vault sends the change back).
+ * No permit, ever.
+ */
+async function vaultPays(c, quoted) {
+  const m = MONEY[c.chainId];
+  // paid as asked: ETH when the request says ETH, else the chain's dollar
+  const inEth = typeof c.request.payWith === "string" && c.request.payWith.trim().toUpperCase() === "ETH";
+  let dollars = 0n;
+  for (const { s, pay, quote } of quoted) {
+    if (pay.inEth !== inEth && (pay.maxUsdc > 0n || s.value > 0n)) stop(`${s.n} pays in ${pay.inEth ? "ETH" : m.symbol}, not what the request asked`);
+    if (pay.permitDeadline !== 0n || pay.permitSig !== "0x") stop(`${s.n} carries a permit: plans approve exactly instead`);
+    if (pay.maxUsdc > (quote.units * 101n) / 100n) stop(`${s.n} lets the vault take up to ${formatUnits(pay.maxUsdc, 6)} ${m.symbol}, over its quote of ${formatUnits(quote.units, 6)}`);
+    if (pay.inEth) {
+      if (s.value > (quote.wei * 103n) / 100n) stop(`${s.n} sends ${formatUnits(s.value, 18)} ETH, over 3% above the vault's quote of ${formatUnits(quote.wei, 18)}`);
+    } else {
+      noEth(s);
+      dollars += pay.maxUsdc;
+    }
+  }
+  const approvals = c.steps.filter((s) => s.kind === "approve");
+  if (dollars === 0n) {
+    if (approvals.length) stop(`${approvals[0].n} approves ${m.symbol} for a plan that pays none`);
+    return;
+  }
+  // an approval only when the wallet's own is short: one, first, exactly what the calls may take
+  if (approvals.length > 1) stop("the plan has more than one approval");
+  if (approvals.length) {
+    approval(approvals[0], getAddress(m.address), "campaignVault", dollars);
+    c.lines.push(`${approvals[0].n}: approve exactly ${formatUnits(dollars, 6)} ${m.symbol} for the campaign vault`);
+  } else {
+    const allowance = await c.pub.readContract({ address: getAddress(m.address), abi: erc20Abi, functionName: "allowance", args: [c.me, PINNED[c.chainId].campaignVault] });
+    if (allowance < dollars) stop(`the vault may take ${formatUnits(dollars, 6)} ${m.symbol} and the plan approves none of it`);
+  }
+}
 
 /** A Base swap: an exact approval for the router (unless ETH goes in), then multicall: one swap that pays the router
  *  itself, then one fee sweep that pays you, then refundETH when ETH went in. On Aerodrome's or Aero's router

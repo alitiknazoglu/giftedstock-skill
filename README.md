@@ -1,8 +1,8 @@
 # giftedstock-skill
 
 Gifted Stock for AI agents. With its own wallet, an agent can buy, open and send mystery boxes of onchain equities,
-swap stock tokens and tokens such as cbBTC and BNKR, bridge between Base and Robinhood Chain, make or claim gift boxes
-and buy baskets on [giftedstock.com](https://www.giftedstock.com).
+swap stock tokens and tokens such as cbBTC and BNKR, bridge between Base and Robinhood Chain, make or claim gift boxes,
+buy baskets and run a brand's partner page and its campaigns on [giftedstock.com](https://www.giftedstock.com).
 
 - **[SKILL.md](SKILL.md)** is the guide an agent reads. The same file is served at
   [giftedstock.com/SKILL.md](https://www.giftedstock.com/SKILL.md).
@@ -17,9 +17,29 @@ and buy baskets on [giftedstock.com](https://www.giftedstock.com).
 
 The agent API (`https://www.giftedstock.com/api/agent/v1`) never holds a key and never sends a transaction. Every write
 endpoint answers with a plan: the unsigned transactions your wallet signs and sends, in order. Approvals are exact and
-the fee is in the plan's summary. Every request names this skill's version (`"skill": "1.4.0"`); without it the API
+the fee is in the plan's summary. Every request names this skill's version (`"skill": "1.5.0"`); without it the API
 answers as 1.2.0 did: the version picks the contracts and the fee a plan is built with. Beyond that nothing in a
 request can change where the output goes, the router, the fee or a spender.
+
+## What an agent can do
+
+| ask your agent | it calls | SKILL.md section |
+|---|---|---|
+| "buy 2 normal boxes on Base", "open my boxes", "send box 123 to vitalik.eth" | `tx/buy`, `tx/open`, `tx/send` | Mystery boxes |
+| "swap 5 USDC for NVIDIA", "bridge 10 USDC to Robinhood Chain" | `tx/swap` | Swaps and bridges |
+| "gift $5 of Apple to a friend", "make a gift link for 10 people" | `tx/gift` | Gift boxes |
+| "buy a box of basket a1b2c", "make a basket of $0.90 NVIDIA and $0.10 Apple" | `tx/basket`, `tx/basket/create` | Baskets |
+| "launch a campaign for my brand", "join this campaign and claim the prize" | the partner routes, `tx/campaign` | Campaigns |
+| "what did I get from my boxes?" | `/wallet`, `/gifts`, `/history` | Read first |
+
+SKILL.md's "What each action takes" says which tokens each action accepts (a Base tokenized stock's ticker ends in
+`c`: NVDAc; a Robinhood Chain stock token's doesn't: NVDA). "When it refuses" lists every refusal code and what to
+do. A request for something the API doesn't take, such as a token no gift can hold, comes back as a refusal that says
+so, and nothing is built or sent:
+
+```json
+{ "error": "unknown_token", "message": "items[0].token \"TSLA\" is not a gift token: did you mean TSLAc (0xb200…0cD0)?" }
+```
 
 ## Use it
 
@@ -48,8 +68,12 @@ that leave the wallet: SKILL.md lists every setting that can refuse a step, and 
 
 ### Check a plan
 
+Run the copy you installed, from its own folder (a Bankr agent keeps it in `/skills/giftedstock/`). Never run the
+default branch: it moves, and its verifier is not the one you reviewed. Without the folder, check out the exact
+commit you installed before `npm ci` or anything else:
+
 ```bash
-git clone https://github.com/alitiknazoglu/giftedstock-skill && cd giftedstock-skill && npm ci
+git clone https://github.com/alitiknazoglu/giftedstock-skill && cd giftedstock-skill && git checkout <the commit you installed> && npm ci
 ```
 
 ```bash
@@ -66,6 +90,56 @@ you made. From JavaScript:
 import { verifyPlan, defaultClients } from "./verify.mjs";
 const { ok, problems, lines, review, unchecked, expect } = await verifyPlan(plan, { wallet, request, clients: defaultClients() });
 ```
+
+### Campaigns
+
+A partner's routes take an agent token instead of the site's cookie. Sign in once (24 hours), then:
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs login
+```
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs partner '{"action":"create","chain":"base","payWith":"USDC","profile":{"name":"Acme","slug":"acme","description":"what we do","site":"https://acme.xyz","logo":"logo.png"}}'
+```
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs upload '{"slug":"acme","kind":"banner","file":"banner.png"}'
+```
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs call '{"method":"POST","path":"/api/partner/acme/campaigns","body":{"mode":"ready","name":"Launch week","description":"Do the tasks, win a box.","bannerUrl":"<the upload url>","startsAt":"2026-12-01T15:00:00Z","endsAt":"2026-12-08T15:00:00Z","box":"premium","winners":20,"boxesPerWinner":1,"rewardStyle":"raffle","tasks":[{"kind":"link_visit","title":"Read our post","config":{"url":"https://acme.xyz/post"}}]}}'
+```
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs campaign '{"action":"launch","slug":"acme","code":"a1b2c","partnerId":"12","payWith":"USDC","prize":{"chain":"base","box":"premium","boxes":20,"perWinner":1,"style":"raffle","startsAt":"2026-12-01T15:00:00Z","endsAt":"2026-12-08T15:00:00Z"}}'
+```
+
+`login` keeps the token in `giftedstock-agent-<address>.token` (readable by you only; `GS_AGENT_TOKEN` wins over
+it); `logout` signs the wallet out everywhere. `partner` makes the partner (the vault's partner fee) and registers its
+page; `campaign` launches, raises (`"action":"raise","chain","partnerId","campaignId","winners":5`) or cancels a saved campaign
+and tells the site. `partner` prints the new partner's vault id and a launch the campaign's: requests name them after;
+`call` is any partner route, and a route that asks the wallet to confirm (428) shows its message and signs it only
+after your yes. A launch is never sent twice: if the site's answer is lost, post the same hash again.
+
+A basket of your own (its first box goes to you, and it goes live with it):
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs basket/create '{"name":"AI LEADERS","items":[{"token":"0x…NVDAc","usd":"0.90"},{"token":"0x…AAPLc","usd":"0.10"}],"payWith":"USDC"}'
+```
+
+Joining a campaign: check its tasks with `call` (`/api/campaign/<code>/task/<id>/click`, then `/verify`), then
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs join '{"code":"a1b2c"}'
+```
+
+```bash
+PRIVATE_KEY=0x… node examples/giftedstock.mjs campaign '{"action":"claim","code":"a1b2c","chain":"base","campaignId":"7"}'
+```
+
+`join` signs the line naming the campaign after your yes; a first-come campaign in the vault takes no join, its claim
+takes the slot. `GET /api/agent/v1/verify?wallet=` says whether the wallet may join verified-only campaigns.
 
 ### The example script
 
@@ -94,7 +168,7 @@ BANKR_API_KEY=bk_… node examples/giftedstock.mjs buy '{"chain":"base","box":"n
 `/wallet/submit` as it is and `BANKR_API_KEY` goes to api.bankr.bot only. The key needs Wallet API access and must not
 be read-only.
 
-Actions: `buy`, `open`, `send`, `settle`, `swap`, `gift`, `basket`, `gift/open`, `gift/take-back` and `claim`. `wallet`
+Actions: `buy`, `open`, `send`, `settle`, `swap`, `gift`, `basket`, `gift/open`, `gift/take-back` and `claim`; for partners and campaigns (1.5.0) `login`, `logout`, `partner`, `campaign`, `call`, `upload`, `join` and `basket/create`. `wallet`
 is filled in from the key, `skill` with this repo's version. A basket always has something for your own look (its
 maker and mix), so it never goes with `--yes`. `--yes` sends without asking, and only when nothing needs your own look: give recipients and stock tokens as
 addresses. `BASE_RPC_URL` and `ROBINHOOD_RPC_URL` pick your own RPCs.
@@ -120,7 +194,13 @@ address goes to the API, and the share URL is printed once the gift is made. A k
   on Base): one hop or two through USDG or USDC, the amount asked then all the router holds, no hooks but AXIS/USDC's own
   pool on Base by its whole key, then that fee, then your wallet. Nothing is left in a router.
 - The least a swap pays is the summary's `minimumOut`, above 0; a plan's deadlines are within its `validUntil`.
-- A Relay deposit is for your wallet; a send goes to the address asked; a gift goes to the wallets asked, or behind a
+- A campaign vault step is for a partner your wallet owns or manages, read on the vault; a launch is the prize asked
+  (box, boxes, boxes a winner, raffle or first come); a raise adds the winners asked; each payment is no more than the
+  vault's own quote, with one exact approval; a take-back goes to your wallet; only the owner cancels, takes boxes back
+  and names managers.
+- A Relay deposit is for your wallet, of the token and amount asked, and funds the Relay order the plan carries
+  (`summary.route.order`, whose EIP-712 hash is the deposit's id): it pays only your wallet, on the other chain, in the
+  token asked, at least the summary's `minimumOut` with no calls there and refunds only your wallet; a send goes to the address asked; a gift goes to the wallets asked, or behind a
   link with your key, the gate (anyone, verified, your list) and times asked, the note you wrote; a take-back comes to
   your wallet.
 - A gift or a basket is bought through the gift router: each item on its exchange from USDC (never Aerodrome classic),
